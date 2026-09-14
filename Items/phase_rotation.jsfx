@@ -60,7 +60,7 @@ COST   = 262144 + 512;    // 180 values
 BINS_L = 262144 + 1024;   // NB values
 BINS_R = 262144 + 1280;   // NB values
 PREV   = 262144 + 2048;   // 4*SUB values: dry (re,im) and wet (re,im) of the previous block's last sub-block
-ESTL   = 262144 + 40000;  // estimate history L (degrees): [0] = e(prev block, sub 2), [1] = e(prev, sub 3), [2..5] = current block
+ESTL   = 262144 + 40000;  // estimate history L (degrees): [0..3] = previous block's sub-blocks, [4..7] = current block
 ESTR   = 262144 + 40016;
 
 function bessel_i0(x) local(s, t, k, q) (
@@ -194,19 +194,18 @@ function estimate(off, slot) local(n, j, xl, xr, hl, hr, a2, mx2l, mx2r, thr2l, 
   ESTL[slot] = el; ESTR[slot] = er;
 );
 
-// optional smoothing of the estimate sequence (median of 3 or 5 around slot 2..)
-function smoothed(arr, slot) local(m, a0, a1, a2, a3, a4, lo, hi, mid) (
-  adapt_smooth < 0.5 ? ( m = arr[slot]; ) : (
+// optional smoothing of the estimate sequence: median of 3 or 5 estimates around 'slot'
+function med3(a, b, c) ( max(min(a, b), min(max(a, b), c)); );
+function est(arr, i) ( i < 0 ? ( i = 0 ); i > 7 ? ( i = 7 ); arr[i]; );   // clamp to the 8 known slots
+function smoothed(arr, slot) local(m, f, g) (
+  adapt_smooth < 0.5 ? ( m = est(arr, slot); ) : (
     adapt_smooth < 1.5 ? (
-      a0 = arr[slot - 1]; a1 = arr[slot]; a2 = arr[slot + 1];
-      m = max(min(a0, a1), min(max(a0, a1), a2));
+      m = med3(est(arr, slot - 1), est(arr, slot), est(arr, slot + 1));
     ) : (
-      a0 = arr[slot - 2]; a1 = arr[slot - 1]; a2 = arr[slot]; a3 = arr[slot + 1]; a4 = arr[slot + 2];
-      // median of 5 via min/max network
-      lo = min(min(a0, a1), min(a2, a3)); hi = max(max(a0, a1), max(a2, a3));
-      mid = (a0 + a1 + a2 + a3) - lo - hi;   // sum of the two middle values of the first four
-      m = max(min(mid - min(a0, max(a1, min(a2, a3))), a4), min(max(a0, min(a1, max(a2, a3))), max(mid - max(a0, min(a1, max(a2, a3))), a4)));
-      m = (a4 > lo && a4 < hi) ? m : (a4 <= lo ? min(max(a0, min(a1, max(a2, a3))), max(a0, min(a1, max(a2, a3)))) : m);
+      // median of five = med3(e, max(min(a,b), min(c,d)), min(max(a,b), max(c,d)))
+      f = max(min(est(arr, slot - 2), est(arr, slot - 1)), min(est(arr, slot + 1), est(arr, slot + 2)));
+      g = min(max(est(arr, slot - 2), est(arr, slot - 1)), max(est(arr, slot + 1), est(arr, slot + 2)));
+      m = med3(est(arr, slot), f, g);
     );
   );
   m;
@@ -221,11 +220,11 @@ function process_block() local(k, n, j, xl, xr, hl, hr, cl, sl, cr, sr_, o, base
   // aligned with the dry sample INBUF[2(j-DFIR)] (FIR delay DFIR).
 
   adaptive ? (
-    // estimates for the current block's sub-blocks go to slots 2..5 (0,1 hold the previous block's last two)
-    k = 0; loop(NSUB, estimate(k * SUB, 2 + k); k += 1;);
+    // estimates for the current block's sub-blocks go to slots 4..7 (0..3 hold the previous block's)
+    k = 0; loop(NSUB, estimate(k * SUB, 4 + k); k += 1;);
   ) : (
     tl = angle_l; tr_ = angle_r;
-    k = 0; loop(NSUB + 2, ESTL[k] = tl; ESTR[k] = tr_; k += 1;);
+    k = 0; loop(2 * NSUB, ESTL[k] = tl; ESTR[k] = tr_; k += 1;);
   );
 
   // Output = [previous block's last sub-block] + [current sub-blocks 0..2]; each output sub-block q
@@ -233,9 +232,10 @@ function process_block() local(k, n, j, xl, xr, hl, hr, cl, sl, cr, sr_, o, base
   // through the sub-block centres, using one sub-block of look-ahead.
   q = 0;
   loop(NSUB,
-    // slot index of the sub-block being output: 1 = previous block's last, 2.. = current
-    s0l = 0.5 * (smoothed(ESTL, q) + smoothed(ESTL, q + 1)); s1l = 0.5 * (smoothed(ESTL, q + 1) + smoothed(ESTL, q + 2));
-    s0r = 0.5 * (smoothed(ESTR, q) + smoothed(ESTR, q + 1)); s1r = 0.5 * (smoothed(ESTR, q + 1) + smoothed(ESTR, q + 2));
+    // slot of the sub-block being output: 3 = previous block's last, 4.. = current block
+    base = 3 + q;
+    s0l = 0.5 * (smoothed(ESTL, base - 1) + smoothed(ESTL, base)); s1l = 0.5 * (smoothed(ESTL, base) + smoothed(ESTL, base + 1));
+    s0r = 0.5 * (smoothed(ESTR, base - 1) + smoothed(ESTR, base)); s1r = 0.5 * (smoothed(ESTR, base) + smoothed(ESTR, base + 1));
     !adaptive ? ( s0l = s1l = angle_l; s0r = s1r = angle_r; );
     step = 1 / SUB;
     n = 0;
@@ -265,8 +265,7 @@ function process_block() local(k, n, j, xl, xr, hl, hr, cl, sl, cr, sr_, o, base
     PREV[4 * n + 2] = FFTBUF[2 * j];     PREV[4 * n + 3] = FFTBUF[2 * j + 1];
     n += 1;
   );
-  ESTL[0] = ESTL[NSUB]; ESTL[1] = ESTL[NSUB + 1];
-  ESTR[0] = ESTR[NSUB]; ESTR[1] = ESTR[NSUB + 1];
+  k = 0; loop(NSUB, ESTL[k] = ESTL[k + NSUB]; ESTR[k] = ESTR[k + NSUB]; k += 1;);
   memcpy(INBUF, INBUF + 2 * HOP, 2 * (MFIR - 1));
 
   // display (wrapped to (-180, 180])
