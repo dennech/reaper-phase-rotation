@@ -415,6 +415,48 @@ def verify(outdir, logpath):
         check("track FX bypassed during render", pk > 0.30, f"peak {pk:.3f} (about 0.4-0.5 expected, half of that if track FX leaked)")
     if "trackfx_enabled_after" in results:
         check("track FX re-enabled after render", results["trackfx_enabled_after"] == "true", results["trackfx_enabled_after"])
+    # ---- reaper_phaserot extension (source wrapper) checks
+    if results.get("ext.api") == "true":
+        def f32(path, nch=1):
+            d = np.fromfile(path, dtype="<f4").astype(np.float64)
+            return d.reshape(-1, nch).T
+        check("ext: analysis rx angle", abs(float(results["ext.analyze_rx"]) - byid["asym_mono"]["channels"][0]["best_angle"]) <= 0.35, results["ext.analyze_rx"])
+        check("ext: analysis min-peak angle", abs(float(results["ext.analyze_peak"]) - byid["asym_mono"]["channels"][0]["minpeak_angle"]) <= 0.35, results["ext.analyze_peak"])
+        sr_a, xa = read_wav(byid["asym_mono"]["file"]); xa = xa[0]; ha = hilbert_fir(xa, sr_a)
+        o = f32(results["ext.rot78.dump"])[0][:len(xa)]
+        err = np.abs(o - rotate(xa, ha, 78.0)).max()
+        check("ext: source output = reference rotation (+78)", err < 1e-6, f"max|err|={err:.2e}")
+        ref78 = rotate(xa, ha, 78.0)
+        check("ext: waveform peaks follow the rotation", abs(float(results["ext.peaks100.max"]) - ref78.max()) < 2e-3 and abs(float(results["ext.peaks100.min"]) - ref78.min()) < 2e-3,
+              f"peaks max {results['ext.peaks100.max']} min {results['ext.peaks100.min']} vs {ref78.max():.4f}/{ref78.min():.4f}")
+        check("ext: undo restores the original", results["ext.undo.params"] == "false" and abs(float(results["ext.undo.peak"]) - np.abs(xa).max()) < 1e-3)
+        check("ext: redo re-applies", results["ext.redo.params"] == "true" and abs(float(results["ext.redo.peak"]) - np.abs(ref78).max()) < 1e-3)
+        check("ext: duplicated item keeps the rotation", results["ext.dup.params"] == "true" and abs(float(results["ext.dup.peak"]) - np.abs(ref78).max()) < 1e-3)
+        check("ext: saved project is a plain project (SOURCE WAVE, no custom type, P_EXT line)", results["ext.rpp.wave"] == "true" and results["ext.rpp.customtype"] == "false" and results["ext.rpp.extline"] == "true")
+        check("ext: rotation restored after project reload", results["ext.reload.params"] == "true" and abs(float(results["ext.reload.peak"]) - np.abs(ref78).max()) < 1e-3)
+        check("ext: bypass passes the original", abs(float(results["ext.bypass.peak"]) - np.abs(xa).max()) < 1e-3)
+        check("ext: reset restores the original", results["ext.clear.params"] == "false" and abs(float(results["ext.clear.peak"]) - np.abs(xa).max()) < 1e-3)
+        sr_s, xs = read_wav(byid["asym_stereo"]["file"]); o2 = f32(results["ext.stereo.dump"], 2)
+        e0 = np.abs(o2[0][:xs.shape[1]] - rotate(xs[0], hilbert_fir(xs[0], sr_s), 30.0)).max()
+        e1 = np.abs(o2[1][:xs.shape[1]] - rotate(xs[1], hilbert_fir(xs[1], sr_s), -45.0)).max()
+        check("ext: stereo unlinked angles (+30 / -45)", e0 < 1e-6 and e1 < 1e-6, f"{e0:.2e} {e1:.2e}")
+        adf = results["ext.adaptive.file"]
+        sr_d, xd = read_wav(adf); xd = xd[0]; hd = hilbert_fir(xd, sr_d)
+        oa = f32(results["ext.adaptive.dump"])[0]; n = min(len(oa), len(xd)); oa = oa[:n]
+        o78 = f32(results["ext.fixed78.dump"])[0][:n]
+        e78 = np.abs(o78 - rotate(xd, hd, 78.0)[:n]).max()
+        check("ext: fixed +78 on the adaptive test file", e78 < 1e-6, f"{e78:.2e}")
+        rx_path = os.path.join(os.path.dirname(adf), "speech_ru_adaptive.wav")
+        if adf.endswith("speech_ru_orig.wav") and os.path.exists(rx_path):
+            _, rx = read_wav(rx_path); rx = rx[0][:n]
+            d = [db(np.abs(oa[k*sr_d:(k+1)*sr_d]).max()) - db(np.abs(rx[k*sr_d:(k+1)*sr_d]).max()) for k in range(int(n / sr_d))]
+            print(f"ext adaptive vs RX adaptive: overall {db(np.abs(oa).max()):.2f} dB vs {db(np.abs(rx).max()):.2f} dB; per-second mean {np.mean(d):+.2f} dB, worst {np.max(d):+.2f} dB")
+            check("ext: adaptive within 0.3 dB of RX's adaptive render", db(np.abs(oa).max()) <= db(np.abs(rx).max()) + 0.3)
+        else:
+            half = n // 2
+            p1 = db(np.abs(oa[sr_d // 2:half - sr_d // 2]).max()); b1 = db(np.abs(xd[sr_d // 2:half - sr_d // 2]).max())
+            p2 = db(np.abs(oa[half + sr_d // 2:-sr_d // 2]).max()); b2 = db(np.abs(xd[half + sr_d // 2:-sr_d // 2]).max())
+            check("ext: adaptive improves both halves of adaptive_switch", p1 <= b1 - 0.5 and p2 <= b2 - 0.5, f"{b1:.2f}->{p1:.2f}, {b2:.2f}->{p2:.2f}")
     if "long_stereo.analyze_seconds" in results:
         print("timing: long_stereo (90 s stereo) analyzed in", results["long_stereo.analyze_seconds"], "s")
     print("\n%d failure(s)" % fails)

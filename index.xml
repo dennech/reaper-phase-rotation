@@ -11,11 +11,31 @@
 ]]></description>
         <link rel="website">https://github.com/dennech/reaper-phase-rotation</link>
       </metadata>
-      <version name="1.0.0" author="dennech" time="2026-09-14T14:00:00Z">
-        <changelog><![CDATA[Initial release: Suggest (peak-minimising channel-linked angle), L/R sliders with Link, Adaptive phase rotation, Preview/Bypass/Render, polar envelope-vs-phase display.]]></changelog>
+      <version name="1.1.0" author="dennech" time="2026-09-14T19:30:00Z">
+        <changelog><![CDATA[Suggest now reproduces iZotope RX 10's values (L8 criterion, RX sign convention). New engine: with the reaper_phaserot extension the rotation is applied to the item's source (no files, no take FX, waveform updates immediately, plain project file). Adaptive mode with look-ahead interpolation matches RX's adaptive peaks. Take-FX engine kept as fallback.]]></changelog>
         <source main="main">https://github.com/dennech/reaper-phase-rotation/raw/main/Items/Phase%20Rotation%20(RX-style).lua</source>
         <source file="phase_rotation_core.lua">https://github.com/dennech/reaper-phase-rotation/raw/main/Items/phase_rotation_core.lua</source>
         <source file="phase_rotation.jsfx" type="effect">https://github.com/dennech/reaper-phase-rotation/raw/main/Items/phase_rotation.jsfx</source>
+      </version>
+    </reapack>
+  </category>
+  <category name="Extensions">
+    <reapack name="reaper_phaserot" type="extension" desc="Phase rotation source engine for the Phase Rotation (RX-style) script">
+      <metadata>
+        <description><![CDATA[{\rtf1\ansi\deff0{\fonttbl{\f0 \fswiss Helvetica;}}
+{\pard \ql \f0 \sa180 \li0 \fi0 {\b reaper_phaserot} applies broadband phase rotation to a media item's SOURCE: playback, render and the waveform display all show the rotated audio, no files are written, no take FX is added, and the project file stays a plain project (without the extension the original file plays unprocessed). Used by the script "Phase Rotation (RX-style)"; also exposes the ReaScript API PhaseRot_SetTake / PhaseRot_ClearTake / PhaseRot_GetTake / PhaseRot_Analyze.\par}
+{\pard \ql \f0 \sa180 \li0 \fi0 Restart REAPER after installing.\par}
+}
+]]></description>
+        <link rel="website">https://github.com/dennech/reaper-phase-rotation</link>
+      </metadata>
+      <version name="1.0.0" author="dennech" time="2026-09-14T19:30:00Z">
+        <changelog><![CDATA[Initial release.]]></changelog>
+        <source platform="darwin-arm64" file="reaper_phaserot.dylib">https://github.com/dennech/reaper-phase-rotation/releases/download/v1.1.0/reaper_phaserot-darwin-universal.dylib</source>
+        <source platform="darwin-x64" file="reaper_phaserot.dylib">https://github.com/dennech/reaper-phase-rotation/releases/download/v1.1.0/reaper_phaserot-darwin-universal.dylib</source>
+        <source platform="win64" file="reaper_phaserot.dll">https://github.com/dennech/reaper-phase-rotation/releases/download/v1.1.0/reaper_phaserot-win64.dll</source>
+        <source platform="linux-x86_64" file="reaper_phaserot.so">https://github.com/dennech/reaper-phase-rotation/releases/download/v1.1.0/reaper_phaserot-linux-x86_64.so</source>
+        <source platform="linux-aarch64" file="reaper_phaserot.so">https://github.com/dennech/reaper-phase-rotation/releases/download/v1.1.0/reaper_phaserot-linux-aarch64.so</source>
       </version>
     </reapack>
   </category>

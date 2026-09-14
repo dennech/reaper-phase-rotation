@@ -47,6 +47,27 @@ shorter/less accurate at very low frequencies than our 8193-tap FIR). Max
 sample difference 3.5e-3 on asym_mono (which has strong low harmonics) and
 9.8e-4 on speech_en.
 
+## Adaptive phase rotation
+
+`speech_ru.wav` was also processed in RX with **Adaptive phase rotation** on (Render →
+Overwrite Original File). A local least-squares fit of the output against `x` and `H{x}`
+in 20 ms windows shows that RX's output is still a pure rotation at every instant
+(relative residual 0.1 %) with a time-varying angle (+11° … +112°, changing at up to
+~120°/s), i.e. the same DSP with a tracked angle.
+
+| speech_ru, peak (dBFS)                        | overall | per-second vs RX (mean / worst) |
+|-----------------------------------------------|--------:|--------------------------------:|
+| original                                      |  −2.64  |                                 |
+| RX fixed Suggest (+78°)                       |  −3.15  |                                 |
+| RX adaptive                                   |  −4.19  |                                 |
+| ours, adaptive (extension and JSFX)           |  −4.14  |          −0.23 dB / +0.09 dB    |
+
+Our adaptive estimator: per 43 ms sub-block the peak-minimising angle (2° bins,
+hysteresis between near-equal minima, silence holds the previous value), linearly
+interpolated between sub-block centres with one sub-block of look-ahead. A causal
+one-pole smoother (the first implementation) was 0.6–1 dB worse than RX; the
+interpolated version matches it.
+
 ## Reproducing
 
 ```bash

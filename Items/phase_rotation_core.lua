@@ -17,7 +17,7 @@ core.VERSION = "1.0.0"
 core.SECTION = "dennech_PhaseRotation"           -- ExtState section
 core.JSFX_FILE = "phase_rotation.jsfx"
 core.FX_DESC = "Phase Rotation (RX-style, Hilbert)"
-core.PARAM = { ANGLE_L = 0, ANGLE_R = 1, LINK = 2, ADAPTIVE = 3, ADAPT_MS = 4, CUR_L = 5, CUR_R = 6 }
+core.PARAM = { ANGLE_L = 0, ANGLE_R = 1, LINK = 2, ADAPTIVE = 3, ADAPT_SMOOTH = 4, CUR_L = 5, CUR_R = 6 }
 
 core.BETA = 8               -- Kaiser beta
 core.THR_REL = 0.1          -- samples with envelope < 0.1 * max are ignored (negligible for both criteria)
@@ -179,17 +179,17 @@ function core.get_state(take, fx)
   return {
     angle_l = g(P.ANGLE_L), angle_r = g(P.ANGLE_R),
     link = g(P.LINK) >= 0.5, adaptive = g(P.ADAPTIVE) >= 0.5,
-    adapt_ms = g(P.ADAPT_MS), cur_l = g(P.CUR_L), cur_r = g(P.CUR_R),
-    enabled = r.TakeFX_GetEnabled(take, fx),
+    smooth = floor(g(P.ADAPT_SMOOTH) + 0.5), cur_l = g(P.CUR_L), cur_r = g(P.CUR_R),
+    enabled = r.TakeFX_GetEnabled(take, fx), mode = "fx",
   }
 end
 
--- st fields are optional: angle_l, angle_r, link, adaptive, adapt_ms, enabled
+-- st fields are optional: angle_l, angle_r, link, adaptive, smooth, enabled
 function core.set_state(take, fx, st)
   local P = core.PARAM
   if st.link ~= nil then r.TakeFX_SetParam(take, fx, P.LINK, st.link and 1 or 0) end
   if st.adaptive ~= nil then r.TakeFX_SetParam(take, fx, P.ADAPTIVE, st.adaptive and 1 or 0) end
-  if st.adapt_ms then r.TakeFX_SetParam(take, fx, P.ADAPT_MS, st.adapt_ms) end
+  if st.smooth then r.TakeFX_SetParam(take, fx, P.ADAPT_SMOOTH, st.smooth) end
   if st.angle_l then r.TakeFX_SetParam(take, fx, P.ANGLE_L, st.angle_l) end
   if st.angle_r then r.TakeFX_SetParam(take, fx, P.ANGLE_R, st.angle_r) end
   if st.enabled ~= nil then r.TakeFX_SetEnabled(take, fx, st.enabled) end
@@ -565,6 +565,128 @@ function core.render(items, opts)
   r.UpdateArrange()
   r.Undo_EndBlock("Phase Rotation: render", -1)
   return n
+end
+
+
+-- ------------------------------------------------ engine: reaper_phaserot extension
+-- With the extension installed the rotation is applied to the take's SOURCE (playback,
+-- render and waveform display) without any take FX or new files. Without it the JSFX
+-- take-FX path above is used.
+
+function core.has_ext()
+  return r.APIExists ~= nil and r.APIExists("PhaseRot_SetTake") and r.APIExists("PhaseRot_Analyze")
+end
+
+function core.mode()
+  return core.has_ext() and "source" or "fx"
+end
+
+function core.ext_get(take)
+  local ok, al, ar, ad, sm, by = r.PhaseRot_GetTake(take, 0, 0, 0, 0, 0)
+  if not ok then return nil end
+  return { angle_l = al, angle_r = ar, adaptive = ad ~= 0, smooth = sm, enabled = by == 0, mode = "source" }
+end
+
+-- st fields optional (merged with the current state): angle_l, angle_r, adaptive, smooth, enabled
+function core.ext_set(take, st)
+  local cur = core.ext_get(take) or { angle_l = 0, angle_r = 0, adaptive = false, smooth = 0, enabled = true }
+  local al = st.angle_l or cur.angle_l
+  local ar = st.angle_r or cur.angle_r
+  local ad = st.adaptive; if ad == nil then ad = cur.adaptive end
+  local sm = st.smooth or cur.smooth or 0
+  local en = st.enabled; if en == nil then en = cur.enabled end
+  return r.PhaseRot_SetTake(take, al, ar, ad and 1 or 0, sm, en and 0 or 1)
+end
+
+function core.ext_clear(take)
+  return r.PhaseRot_ClearTake(take)
+end
+
+-- max envelope per degree -> signed peaks after rotating by theta (degrees)
+function core.peaks_after_shape(shape, theta)
+  local th = theta * PI / 180
+  local pos, neg = 0, 0
+  for d = 1, 360 do
+    local a = shape[d]
+    if a and a > 0 then
+      local v = a * cos((d - 0.5) * PI / 180 - th)
+      if v > pos then pos = v elseif -v > neg then neg = -v end
+    end
+  end
+  return pos, neg
+end
+
+local function parse_kv(text)
+  local t = {}
+  for k, v in text:gmatch("([%w_]+)=([^%s]*)") do t[k] = v end
+  return t
+end
+
+-- Analysis by the extension (on the ORIGINAL audio, even when the take is already rotated).
+function core.analyze_ext(take, opts)
+  opts = opts or {}
+  local criterion = opts.criterion == "peak" and "peak" or "rx"
+  local t0 = r.time_precise()
+  if not r.PhaseRot_Analyze(take) then return nil, "analysis failed (not an audio take?)" end
+  local kv = parse_kv(r.GetExtState("phaserot", "analysis"))
+  local nch = tonumber(kv.nch) or 1
+  local res = { nch = nch, sr = tonumber(kv.sr) or 48000, duration = tonumber(kv.length) or 0, channels = {},
+                criterion = criterion, mode = "source", peak_before = tonumber(kv.peak_before) or 0 }
+  res.nsamples = floor(res.duration * res.sr + 0.5)
+  for c = 0, nch - 1 do
+    local shape = {}
+    local i = 0
+    for v in (kv["shape" .. c] or ""):gmatch("[^,]+") do i = i + 1; shape[i] = tonumber(v) or 0 end
+    for j = i + 1, 360 do shape[j] = 0 end
+    local a_rx, a_pk = tonumber(kv["ch" .. c .. "_rx"]) or 0, tonumber(kv["ch" .. c .. "_peak"]) or 0
+    local ang = criterion == "peak" and a_pk or a_rx
+    local pos, neg = core.peaks_after_shape(shape, ang)
+    res.channels[c + 1] = {
+      pos_before = tonumber(kv["ch" .. c .. "_pos_before"]) or 0, neg_before = tonumber(kv["ch" .. c .. "_neg_before"]) or 0,
+      peak_before = tonumber(kv["ch" .. c .. "_before"]) or 0,
+      best_angle = ang, peak_after = criterion == "peak" and (tonumber(kv["ch" .. c .. "_minpeak"]) or 0) or (tonumber(kv["ch" .. c .. "_after_rx"]) or 0),
+      pos_after = pos, neg_after = neg, angle_rx = a_rx, angle_peak = a_pk,
+      min_peak = tonumber(kv["ch" .. c .. "_minpeak"]) or 0, shape = shape,
+    }
+  end
+  local l_rx, l_pk = tonumber(kv.linked_rx) or 0, tonumber(kv.linked_peak) or 0
+  local lang = criterion == "peak" and l_pk or l_rx
+  local lpos, lneg = 0, 0
+  for c = 1, nch do
+    local p_, n_ = core.peaks_after_shape(res.channels[c].shape, lang)
+    lpos, lneg = max(lpos, p_), max(lneg, n_)
+  end
+  res.linked = { angle = lang, peak_after = criterion == "peak" and (tonumber(kv.linked_minpeak) or 0) or (tonumber(kv.linked_after_rx) or 0),
+                 pos_after = lpos, neg_after = lneg, angle_rx = l_rx, angle_peak = l_pk, min_peak = tonumber(kv.linked_minpeak) or 0 }
+  res.seconds = r.time_precise() - t0
+  return res
+end
+
+-- ------------------------------------------------------------ unified take API
+-- state: { angle_l, angle_r, adaptive, smooth, enabled, mode } or nil when nothing is applied
+function core.get_take_state(take)
+  if core.mode() == "source" then return core.ext_get(take) end
+  local fx = core.find_fx(take)
+  if fx < 0 then return nil end
+  return core.get_state(take, fx)
+end
+
+function core.set_take_state(take, st)
+  if core.mode() == "source" then return core.ext_set(take, st) end
+  local fx, err = core.ensure_fx(take)
+  if fx < 0 then return false, err end
+  core.set_state(take, fx, st)
+  return true
+end
+
+function core.clear_take(take)
+  if core.mode() == "source" then return core.ext_clear(take) end
+  return core.remove_fx(take)
+end
+
+function core.analyze_any(take, opts, progress)
+  if core.mode() == "source" then return core.analyze_ext(take, opts) end
+  return core.analyze(take, opts, progress)
 end
 
 return core

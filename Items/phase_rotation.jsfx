@@ -11,9 +11,10 @@ desc:Phase Rotation (RX-style, Hilbert)
 //
 //   y = cos(theta) * x + sin(theta) * H{x}
 //
-// Adaptive mode estimates, every ~43 ms, the angle minimising the peak of the
-// block and glides to it (per block, the plain peak criterion gives lower peaks
-// than the L8 criterion that the Lua "Suggest" uses to match RX's numbers).
+// Adaptive mode estimates, for every ~43 ms sub-block, the angle minimising the
+// peak of that sub-block and interpolates the angle linearly between sub-block
+// centres (one sub-block of look-ahead). On speech this matches the peak levels
+// of RX's adaptive mode (see tests/RX_REFERENCE.md).
 //
 // Part of "REAPER Phase Rotation": https://github.com/dennech/reaper-phase-rotation
 // The Lua script "Phase Rotation (RX-style).lua" drives this effect
@@ -28,7 +29,7 @@ slider1:angle_l=0<-180,180,0.1>Left rotation (deg)
 slider2:angle_r=0<-180,180,0.1>Right rotation (deg)
 slider3:link=1<0,1,1{Off,On}>Link L/R
 slider4:adaptive=0<0,1,1{Off,On}>Adaptive phase rotation
-slider5:adapt_ms=250<20,2000,10>Adaptive response (ms)
+slider5:adapt_smooth=0<0,2,1{Off,Light (median of 3),Strong (median of 5)}>Adaptive smoothing
 slider6:cur_l_deg=0<-180,180,0.01>-Current L rotation (read-only)
 slider7:cur_r_deg=0<-180,180,0.01>-Current R rotation (read-only)
 
@@ -47,6 +48,7 @@ GATE2 = 0.000001;         // adaptive: hold below -60 dBFS envelope (no exponent
 RELGATE2 = 0.01;          // adaptive: hold below -20 dB of the recent peak
 THR2 = 0.25;              // adaptive: only samples with envelope >= 0.5 * block max can set the peak
 TIE = 1.002;              // adaptive: peaks within 0.2% (0.017 dB) count as equal (hysteresis picks the nearest)
+NSUB = 4;                 // sub-blocks per FFT block
 
 // ---------------------------------------------------------------- memory map
 FFTBUF = 0;               // 2*NFFT values  (must not cross a 65536 boundary)
@@ -57,6 +59,9 @@ ABSCOS = 262144;          // 360 values |cos(i deg)|
 COST   = 262144 + 512;    // 180 values
 BINS_L = 262144 + 1024;   // NB values
 BINS_R = 262144 + 1280;   // NB values
+PREV   = 262144 + 2048;   // 4*SUB values: dry (re,im) and wet (re,im) of the previous block's last sub-block
+ESTL   = 262144 + 40000;  // estimate history L (degrees): [0] = e(prev block, sub 2), [1] = e(prev, sub 3), [2..5] = current block
+ESTR   = 262144 + 40016;
 
 function bessel_i0(x) local(s, t, k, q) (
   q = x * x * 0.25; s = 1; t = 1; k = 1;
@@ -69,8 +74,7 @@ function setup() local(k, w, i0b, i) (
   MFIR = NFFT / 2 + 1;                       // FIR length (odd)
   DFIR = (MFIR - 1) / 2;                     // FIR group delay
   HOP = NFFT / 2;                         // new samples per block (= NFFT - MFIR + 1)
-  SUB = HOP / 4;                       // adaptive analysis sub-block (~43 ms)
-  NSUB = 4;
+  SUB = HOP / NSUB;                    // adaptive analysis sub-block (~43 ms)
 
   // Kaiser-windowed ideal Hilbert transformer, pre-scaled by 1/NFFT (unnormalised ifft)
   i0b = bessel_i0(BETA);
@@ -88,12 +92,14 @@ function setup() local(k, w, i0b, i) (
 
   memset(INBUF, 0, 2 * NFFT);
   memset(OUTBUF, 0, 2 * HOP);
+  memset(PREV, 0, 4 * SUB);
+  memset(ESTL, 0, 16); memset(ESTR, 0, 16);
   pos = 0;
 
   i = 0;
   loop(360, ABSCOS[i] = abs(cos(i * $pi / 180)); i += 1;);
 
-  pdc_delay = HOP + DFIR;
+  pdc_delay = HOP + SUB + DFIR;        // block + one sub-block of look-ahead + FIR delay
   pdc_bot_ch = 0; pdc_top_ch = 2;
   runpk2_l = 0; runpk2_r = 0;
   coef_manual = 1 - exp(-1 / (0.010 * srate));
@@ -133,8 +139,11 @@ function search(bins, cur_deg) local(t, b, c, v, idx, best, bestt, d, bestd, rep
   rep;
 );
 
-// Estimate target angles from sub-block starting at block-relative offset 'off'.
-function estimate(off) local(n, j, xl, xr, hl, hr, a2, mx2l, mx2r, thr2l, thr2r, ph, b, amp, hold_l, hold_r, el, er, dec) (
+// Estimate the best angle for the sub-block starting at block-relative offset 'off'
+// and store it (degrees, continuous) in ESTL[slot] / ESTR[slot]. Silent sub-blocks
+// carry the previous estimate (snapped to the principal branch, inaudible while silent).
+function estimate(off, slot) local(n, j, xl, xr, hl, hr, a2, mx2l, mx2r, thr2l, thr2r, ph, b, amp, hold_l, hold_r, el, er, pl, pr, dec) (
+  pl = ESTL[slot - 1]; pr = ESTR[slot - 1];
   mx2l = 0; mx2r = 0; n = 0;
   loop(SUB,
     j = MFIR - 1 + off + n;
@@ -142,7 +151,7 @@ function estimate(off) local(n, j, xl, xr, hl, hr, a2, mx2l, mx2r, thr2l, thr2r,
     xr = INBUF[2 * (j - DFIR) + 1]; hr = FFTBUF[2 * j + 1]; a2 = xr * xr + hr * hr; a2 > mx2r ? ( mx2r = a2 );
     n += 1;
   );
-  dec = 0.97;   // about -6 dB/s decay of the recent-peak tracker (per 43 ms sub-block)
+  dec = 0.97;   // about -3 dB/s decay of the recent-peak tracker (per 43 ms sub-block)
   runpk2_l = max(mx2l, runpk2_l * dec); runpk2_r = max(mx2r, runpk2_r * dec);
   hold_l = mx2l < GATE2 || mx2l < runpk2_l * RELGATE2;
   hold_r = mx2r < GATE2 || mx2r < runpk2_r * RELGATE2;
@@ -168,18 +177,42 @@ function estimate(off) local(n, j, xl, xr, hl, hr, a2, mx2l, mx2r, thr2l, thr2r,
       );
       n += 1;
     );
-    link ? (
-      b = 0; loop(NB, BINS_L[b] = max(BINS_L[b], BINS_R[b]); b += 1;);
-      el = search(BINS_L, cur_l * 180 / $pi);
-      tgt_l = el * $pi / 180; tgt_r = tgt_l;
-    ) : (
-      !hold_l ? ( tgt_l = search(BINS_L, cur_l * 180 / $pi) * $pi / 180 );
-      !hold_r ? ( tgt_r = search(BINS_R, cur_r * 180 / $pi) * $pi / 180 );
-    );
   );
+  link ? (
+    hold_l ? ( el = pl; ) : (
+      b = 0; loop(NB, BINS_L[b] = max(BINS_L[b], BINS_R[b]); b += 1;);
+      el = search(BINS_L, pl);
+    );
+    er = el;
+  ) : (
+    el = hold_l ? pl : search(BINS_L, pl);
+    er = hold_r ? pr : search(BINS_R, pr);
+  );
+  // while silent, fold back to the principal branch (-90, 90] so long takes cannot drift into inverted polarity
+  hold_l ? ( el = el - 180 * floor((el + 90) / 180); );
+  hold_r ? ( er = er - 180 * floor((er + 90) / 180); );
+  ESTL[slot] = el; ESTR[slot] = er;
 );
 
-function process_block() local(k, n, j, xl, xr, hl, hr, cl, sl, cr, sr_, coef, o) (
+// optional smoothing of the estimate sequence (median of 3 or 5 around slot 2..)
+function smoothed(arr, slot) local(m, a0, a1, a2, a3, a4, lo, hi, mid) (
+  adapt_smooth < 0.5 ? ( m = arr[slot]; ) : (
+    adapt_smooth < 1.5 ? (
+      a0 = arr[slot - 1]; a1 = arr[slot]; a2 = arr[slot + 1];
+      m = max(min(a0, a1), min(max(a0, a1), a2));
+    ) : (
+      a0 = arr[slot - 2]; a1 = arr[slot - 1]; a2 = arr[slot]; a3 = arr[slot + 1]; a4 = arr[slot + 2];
+      // median of 5 via min/max network
+      lo = min(min(a0, a1), min(a2, a3)); hi = max(max(a0, a1), max(a2, a3));
+      mid = (a0 + a1 + a2 + a3) - lo - hi;   // sum of the two middle values of the first four
+      m = max(min(mid - min(a0, max(a1, min(a2, a3))), a4), min(max(a0, min(a1, max(a2, a3))), max(mid - max(a0, min(a1, max(a2, a3))), a4)));
+      m = (a4 > lo && a4 < hi) ? m : (a4 <= lo ? min(max(a0, min(a1, max(a2, a3))), max(a0, min(a1, max(a2, a3)))) : m);
+    );
+  );
+  m;
+);
+
+function process_block() local(k, n, j, xl, xr, hl, hr, cl, sl, cr, sr_, o, base, s0l, s1l, s0r, s1r, tl, tr_, step, q) (
   memcpy(FFTBUF, INBUF, 2 * NFFT);
   fft(FFTBUF, NFFT);
   convolve_c(FFTBUF, HSPEC, NFFT);
@@ -188,37 +221,55 @@ function process_block() local(k, n, j, xl, xr, hl, hr, cl, sl, cr, sr_, coef, o
   // aligned with the dry sample INBUF[2(j-DFIR)] (FIR delay DFIR).
 
   adaptive ? (
-    coef = 1 - exp(-1 / (max(adapt_ms, 1) * 0.001 * srate));
+    // estimates for the current block's sub-blocks go to slots 2..5 (0,1 hold the previous block's last two)
+    k = 0; loop(NSUB, estimate(k * SUB, 2 + k); k += 1;);
   ) : (
-    // read the sliders here (no dependency on the slider section having run)
-    coef = coef_manual;
-    tgt_l = angle_l * $pi / 180;
-    tgt_r = angle_r * $pi / 180;
+    tl = angle_l; tr_ = angle_r;
+    k = 0; loop(NSUB + 2, ESTL[k] = tl; ESTR[k] = tr_; k += 1;);
   );
 
-  k = 0;
+  // Output = [previous block's last sub-block] + [current sub-blocks 0..2]; each output sub-block q
+  // ramps from the midpoint of (e[q-1], e[q]) to the midpoint of (e[q], e[q+1]) -- linear interpolation
+  // through the sub-block centres, using one sub-block of look-ahead.
+  q = 0;
   loop(NSUB,
-    adaptive ? ( estimate(k * SUB) );
+    // slot index of the sub-block being output: 1 = previous block's last, 2.. = current
+    s0l = 0.5 * (smoothed(ESTL, q) + smoothed(ESTL, q + 1)); s1l = 0.5 * (smoothed(ESTL, q + 1) + smoothed(ESTL, q + 2));
+    s0r = 0.5 * (smoothed(ESTR, q) + smoothed(ESTR, q + 1)); s1r = 0.5 * (smoothed(ESTR, q + 1) + smoothed(ESTR, q + 2));
+    !adaptive ? ( s0l = s1l = angle_l; s0r = s1r = angle_r; );
+    step = 1 / SUB;
     n = 0;
     loop(SUB,
-      j = MFIR - 1 + k * SUB + n;
-      xl = INBUF[2 * (j - DFIR)]; xr = INBUF[2 * (j - DFIR) + 1];
-      hl = FFTBUF[2 * j];      hr = FFTBUF[2 * j + 1];
-      cur_l += (tgt_l - cur_l) * coef; cur_r += (tgt_r - cur_r) * coef;
+      q == 0 ? (
+        xl = PREV[4 * n]; xr = PREV[4 * n + 1]; hl = PREV[4 * n + 2]; hr = PREV[4 * n + 3];
+      ) : (
+        j = MFIR - 1 + (q - 1) * SUB + n;
+        xl = INBUF[2 * (j - DFIR)]; xr = INBUF[2 * (j - DFIR) + 1];
+        hl = FFTBUF[2 * j];      hr = FFTBUF[2 * j + 1];
+      );
+      cur_l = (s0l + (s1l - s0l) * (n + 0.5) * step) * $pi / 180;
+      cur_r = (s0r + (s1r - s0r) * (n + 0.5) * step) * $pi / 180;
       cl = cos(cur_l); sl = sin(cur_l); cr = cos(cur_r); sr_ = sin(cur_r);
-      o = 2 * (k * SUB + n);
+      o = 2 * (q * SUB + n);
       OUTBUF[o]     = cl * xl + sl * hl;
       OUTBUF[o + 1] = cr * xr + sr_ * hr;
       n += 1;
     );
-    k += 1;
+    q += 1;
   );
+  // keep the current block's last sub-block (dry + wet) and the last two estimates for the next block
+  n = 0;
+  loop(SUB,
+    j = MFIR - 1 + (NSUB - 1) * SUB + n;
+    PREV[4 * n] = INBUF[2 * (j - DFIR)]; PREV[4 * n + 1] = INBUF[2 * (j - DFIR) + 1];
+    PREV[4 * n + 2] = FFTBUF[2 * j];     PREV[4 * n + 3] = FFTBUF[2 * j + 1];
+    n += 1;
+  );
+  ESTL[0] = ESTL[NSUB]; ESTL[1] = ESTL[NSUB + 1];
+  ESTR[0] = ESTR[NSUB]; ESTR[1] = ESTR[NSUB + 1];
   memcpy(INBUF, INBUF + 2 * HOP, 2 * (MFIR - 1));
 
-  // keep the continuous angle bounded (cos/sin are unchanged by +-360)
-  cur_l > 2 * $pi ? ( cur_l -= 2 * $pi; tgt_l -= 2 * $pi; ) : ( cur_l < -2 * $pi ? ( cur_l += 2 * $pi; tgt_l += 2 * $pi; ) );
-  cur_r > 2 * $pi ? ( cur_r -= 2 * $pi; tgt_r -= 2 * $pi; ) : ( cur_r < -2 * $pi ? ( cur_r += 2 * $pi; tgt_r += 2 * $pi; ) );
-  // wrap to (-180, 180] for display
+  // display (wrapped to (-180, 180])
   cur_l_deg = cur_l * 180 / $pi; cur_l_deg = cur_l_deg - 360 * floor((cur_l_deg + 180) / 360);
   cur_r_deg = cur_r * 180 / $pi; cur_r_deg = cur_r_deg - 360 * floor((cur_r_deg + 180) / 360);
 );
@@ -227,10 +278,7 @@ function process_block() local(k, n, j, xl, xr, hl, hr, cl, sl, cr, sr_, coef, o
 // functions defined below the first top-level statement are not visible to
 // other sections) ------------------------------------------------------------
 setup();
-man_l = angle_l * $pi / 180;
-man_r = angle_r * $pi / 180;
-cur_l = man_l; cur_r = man_r;
-tgt_l = man_l; tgt_r = man_r;
+cur_l = angle_l * $pi / 180; cur_r = angle_r * $pi / 180;
 prev_l = angle_l; prev_r = angle_r;
 
 @slider
@@ -238,9 +286,6 @@ link ? (
   angle_l != prev_l ? ( angle_r = angle_l; ) : ( angle_r != prev_r ? ( angle_l = angle_r; ) );
 );
 prev_l = angle_l; prev_r = angle_r;
-man_l = angle_l * $pi / 180;
-man_r = angle_r * $pi / 180;
-!adaptive ? ( tgt_l = man_l; tgt_r = man_r; );
 
 @sample
 INBUF[2 * (MFIR - 1 + pos)]     = spl0;
@@ -257,7 +302,7 @@ gfx_setfont(1, "Arial", 14);
 gfx_r = 0.85; gfx_g = 0.85; gfx_b = 0.85;
 gfx_x = 10; gfx_y = 10;
 adaptive ? (
-  gfx_printf("Adaptive phase rotation: ON (%d ms)", adapt_ms);
+  gfx_printf("Adaptive phase rotation: ON");
   gfx_x = 10; gfx_y = 32; gfx_printf("Current rotation  L %+.1f deg   R %+.1f deg", cur_l_deg, cur_r_deg);
 ) : (
   link ? gfx_printf("Fixed rotation  L %+.1f deg   R %+.1f deg  (linked)", angle_l, angle_r)

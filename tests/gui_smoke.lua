@@ -21,8 +21,9 @@ local ok, err = pcall(dofile, REPO .. "/Items/Phase Rotation (RX-style).lua")
 if not ok then local g = io.open(LOG, "a") g:write("ERROR loading gui: " .. tostring(err) .. "\n") g:close() end
 -- poll for the gui to finish (the "quit" action returns from its defer loop), then quit REAPER
 local t0 = reaper.time_precise()
+local ACTLOG = os.getenv("PHASE_ROTATION_TEST_LOG") or LOG
 local function poll()
-  local g = io.open(LOG, "r"); local txt = g:read("*a"); g:close()
+  local g = io.open(ACTLOG, "r"); local txt = g and g:read("*a") or ""; if g then g:close() end
   if txt:find("\nquit") or txt:find("ERROR") or reaper.time_precise() - t0 > 90 then
     local h = io.open(LOG, "a")
     h:write(string.format("items=%d takes_a=%d takes_b=%d\n", reaper.CountMediaItems(0), reaper.CountTakes(a), reaper.CountTakes(b)))

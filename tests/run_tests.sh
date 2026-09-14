@@ -37,15 +37,37 @@ export PR_REPO="$REPO" PR_TEST_DIR="$SCRATCH/testsignals" PR_TEST_OUT="$SCRATCH/
 [ -d "${PR_RX_REF_DIR:-$SCRATCH/rx_ref}" ] && export PR_RX_REF_DIR="${PR_RX_REF_DIR:-$SCRATCH/rx_ref}"
 rm -f "$PR_TEST_OUT"
 run_reaper() { # $1 = script, $2 = log file, $3 = end marker
-  "$REAPER_BIN" -newinst -nosplash -ignoreerrors -cfgfile "$RES/reaper.ini" -new "$1" >/dev/null 2>&1 &
+  rm -f "$2"   # a stale log from a previous run would satisfy the end-marker check immediately
+  sleep 2      # let the previous instance release the resource directory
+  "$REAPER_BIN" -newinst -nosplash -ignoreerrors -cfgfile "$RES/reaper.ini" -new "$1" >"$2.stdout" 2>&1 &
   local pid=$!
   local waited=0
-  until grep -q -E "$3" "$2" 2>/dev/null || ! kill -0 "$pid" 2>/dev/null || [ "$waited" -ge 600 ]; do sleep 1; waited=$((waited+1)); done
+  until grep -q -E "$3" "$2" 2>/dev/null || ! kill -0 "$pid" 2>/dev/null || [ "$waited" -ge 180 ]; do sleep 1; waited=$((waited+1)); done
   sleep 1
   kill -9 "$pid" 2>/dev/null; wait "$pid" 2>/dev/null || true   # the project lives in scratch: no need to let REAPER ask about saving
 }
+# ---- extension: build (if cmake is available) and install into the isolated UserPlugins
+EXT_BIN=""
+if command -v cmake >/dev/null 2>&1; then
+  if [ "$(uname)" = "Darwin" ]; then
+    cmake -S "$REPO/extension" -B "$REPO/extension/build" -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" >/dev/null && cmake --build "$REPO/extension/build" >/dev/null
+    EXT_BIN="$REPO/extension/build/reaper_phaserot.dylib"
+  else
+    cmake -S "$REPO/extension" -B "$REPO/extension/build" >/dev/null && cmake --build "$REPO/extension/build" >/dev/null
+    EXT_BIN="$REPO/extension/build/reaper_phaserot.so"
+  fi
+  mkdir -p "$RES/UserPlugins" && cp "$EXT_BIN" "$RES/UserPlugins/"
+fi
+mkdir -p "$SCRATCH/out"
+export PR_OUT_DIR="$SCRATCH/out"
+
 run_reaper "$REPO/tests/run_in_reaper.lua" "$PR_TEST_OUT" "^DONE"
 echo "---- REAPER log:"; cat "$PR_TEST_OUT"
+if [ -n "$EXT_BIN" ]; then
+  PR_TEST_OUT="$SCRATCH/ext_test.log" run_reaper "$REPO/tests/ext_test.lua" "$SCRATCH/ext_test.log" "^DONE"
+  echo "---- extension log:"; cat "$SCRATCH/ext_test.log" | cut -c1-200
+  cat "$SCRATCH/ext_test.log" >> "$PR_TEST_OUT"
+fi
 echo "---- verify:"; "$PY" "$REPO/tests/reference.py" verify "$SCRATCH/testsignals" "$PR_TEST_OUT"
 
 # ---- GUI smoke test (scripted actions through the real GUI script)
@@ -55,3 +77,6 @@ export PR_TEST_OUT="$SCRATCH/gui_smoke.log" PR_PROJ="$SCRATCH/proj/gui.rpp"
 run_reaper "$REPO/tests/gui_smoke.lua" "$SCRATCH/gui_smoke.log" "gui smoke end"
 echo "---- GUI smoke:"; cat "$SCRATCH/gui_smoke.log"; cat "$PHASE_ROTATION_TEST_LOG"
 if grep -q ERROR "$SCRATCH/gui_smoke.log" "$PHASE_ROTATION_TEST_LOG"; then echo "GUI SMOKE FAILED"; exit 1; fi
+# after Suggest the first item (asym_mono) must carry the RX-style angle (+77.6)
+if ! grep -q "res=77.625" "$PHASE_ROTATION_TEST_LOG"; then echo "GUI SMOKE FAILED: Suggest did not produce the expected angle"; exit 1; fi
+echo "ALL TESTS PASSED"

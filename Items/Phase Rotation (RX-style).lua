@@ -1,6 +1,6 @@
--- @description Phase Rotation (RX-style): suggest, preview and render broadband phase rotation for selected items
+-- @description Phase Rotation (RX-style): suggest, audition and apply broadband phase rotation to selected items
 -- @author dennech
--- @version 1.0.0
+-- @version 1.1.0
 -- @provides
 --   [nomain] phase_rotation_core.lua
 --   [effect] phase_rotation.jsfx
@@ -9,14 +9,13 @@
 --   # Phase Rotation (RX-style)
 --
 --   A REAPER re-creation of the iZotope RX "Phase" module for media items:
---   Suggest (finds the channel-linked fixed rotation that minimises the peak
---   level), Left/Right rotation sliders with link, Adaptive phase rotation,
---   Preview / Bypass and Render (bakes the rotation into a new take).
+--   Suggest (reproduces RX's own values), Left/Right rotation with Link,
+--   Adaptive phase rotation, Preview / Bypass.
 --
---   Select one or more audio items and run the script. Processing is done
---   by the bundled JSFX "Phase Rotation (RX-style, Hilbert)" which is
---   inserted as a take FX, so everything stays non-destructive until you
---   press Render.
+--   With the reaper_phaserot extension installed (recommended) the rotation is
+--   applied to the item's source: no files are written, no FX is added, the
+--   waveform display updates immediately, the project file stays a plain
+--   project. Without the extension the bundled JSFX is used as a take FX.
 --
 --   Keys: S = Suggest, Space = Preview, B = Bypass, Esc = close.
 
@@ -32,15 +31,16 @@ end
 local TITLE = "Phase Rotation (RX-style)"
 local SECTION = core.SECTION
 local floor, abs, max, min, cos, sin = math.floor, math.abs, math.max, math.min, math.cos, math.sin
+local MODE = core.mode()          -- "source" (extension) or "fx" (JSFX take FX)
 
 -- ------------------------------------------------------------------ settings
-local S = { link = true, adaptive = false, adapt_ms = 250, keep_original = true, solo_preview = false, criterion = "rx" }
+local S = { link = true, adaptive = false, smooth = 0, keep_original = true, solo_preview = false, criterion = "rx" }
 do
   local function getb(k, d) local v = r.GetExtState(SECTION, k) if v == "" then return d end return v == "1" end
   local function getn(k, d) local v = tonumber(r.GetExtState(SECTION, k)) return v or d end
   S.link = getb("link", true)
   S.adaptive = getb("adaptive", false)
-  S.adapt_ms = getn("adapt_ms", 250)
+  S.smooth = floor(getn("smooth", 0) + 0.5)
   S.keep_original = getb("keep_original", true)
   S.solo_preview = getb("solo_preview", false)
   S.criterion = r.GetExtState(SECTION, "criterion") == "peak" and "peak" or "rx"
@@ -48,16 +48,16 @@ end
 local function save_settings()
   r.SetExtState(SECTION, "link", S.link and "1" or "0", true)
   r.SetExtState(SECTION, "adaptive", S.adaptive and "1" or "0", true)
-  r.SetExtState(SECTION, "adapt_ms", tostring(S.adapt_ms), true)
+  r.SetExtState(SECTION, "smooth", tostring(S.smooth), true)
   r.SetExtState(SECTION, "keep_original", S.keep_original and "1" or "0", true)
   r.SetExtState(SECTION, "solo_preview", S.solo_preview and "1" or "0", true)
   r.SetExtState(SECTION, "criterion", S.criterion, true)
 end
 
 -- --------------------------------------------------------------------- state
-local items = {}          -- { item, guid, take, info, res, fx, st }
+local items = {}          -- { item, guid, take, info, res, st }
 local cur = 1
-local cache = {}          -- guid -> analysis result
+local cache = {}          -- guid..take -> analysis result
 local sel_sig = ""
 local status, status_t = "", 0
 local busy = nil
@@ -73,20 +73,17 @@ end
 
 local function refresh_items(force)
   local n = r.CountSelectedMediaItems(0)
-  local sig = {}
-  local list = {}
+  local sig, list = {}, {}
   for i = 0, n - 1 do
     local item = r.GetSelectedMediaItem(0, i)
     local take = r.GetActiveTake(item)
     if take and not r.TakeIsMIDI(take) then
       local g = item_guid(item)
-      sig[#sig + 1] = g
+      sig[#sig + 1] = g .. tostring(take)
       list[#list + 1] = { item = item, guid = g, take = take }
     end
   end
   sig = table.concat(sig, "|")
-  -- also detect an active-take change (after Render)
-  for _, e in ipairs(list) do sig = sig .. tostring(e.take) end
   if not force and sig == sel_sig then return end
   sel_sig = sig
   items = list
@@ -97,31 +94,26 @@ local function refresh_items(force)
   if cur > #items then cur = max(1, #items) end
 end
 
--- read FX state of an entry (nil if no FX)
-local function fx_state(e)
-  local fx = core.find_fx(e.take)
-  e.fx = fx
-  if fx < 0 then e.st = nil return nil end
-  e.st = core.get_state(e.take, fx)
+local function take_state(e)
+  e.st = core.get_take_state(e.take)
   return e.st
 end
 
-local function ensure_fx(e)
-  local fx, err = core.ensure_fx(e.take)
-  if fx < 0 then
-    set_status("Error: " .. tostring(err))
-    r.ShowMessageBox(tostring(err), TITLE, 0)
-    return nil
-  end
-  e.fx = fx
-  return fx
+-- ------------------------------------------------------------------ actions
+local function report_error(err)
+  set_status("Error: " .. tostring(err))
+  r.ShowMessageBox(tostring(err), TITLE, 0)
 end
 
--- ------------------------------------------------------------------ actions
+local function set_state(e, st)
+  local ok, err = core.set_take_state(e.take, st)
+  if not ok and err then report_error(err) end
+  return ok
+end
+
 local function apply_mode_to_all()
   for _, e in ipairs(items) do
-    local fx = core.find_fx(e.take)
-    if fx >= 0 then core.set_state(e.take, fx, { link = S.link, adaptive = S.adaptive, adapt_ms = S.adapt_ms }) end
+    if core.get_take_state(e.take) then core.set_take_state(e.take, { adaptive = S.adaptive, smooth = S.smooth, link = S.link }) end
   end
 end
 
@@ -134,7 +126,7 @@ local function angles_from_result(res)
   return res.channels[1].best_angle, res.channels[2].best_angle
 end
 
-local function draw() end -- forward
+local draw = function() end -- forward
 
 local function do_suggest()
   if #items == 0 then return end
@@ -143,18 +135,13 @@ local function do_suggest()
   local errs = 0
   for i, e in ipairs(items) do
     busy = { text = string.format("Analyzing item %d of %d ...", i, #items), frac = 0 }
-    local res, err = core.analyze(e.take, { criterion = S.criterion }, function(f)
-      busy.frac = f
-      draw(); gfx.update()
-    end)
+    draw(); gfx.update()
+    local res, err = core.analyze_any(e.take, { criterion = S.criterion }, function(f) busy.frac = f; draw(); gfx.update() end)
     if res then
       e.res = res
       cache[e.guid .. tostring(e.take)] = res
-      local fx = ensure_fx(e)
-      if fx then
-        local al, ar = angles_from_result(res)
-        core.set_state(e.take, fx, { link = S.link, adaptive = S.adaptive, adapt_ms = S.adapt_ms, angle_l = al, angle_r = ar, enabled = true })
-      end
+      local al, ar = angles_from_result(res)
+      set_state(e, { link = S.link, adaptive = S.adaptive, smooth = S.smooth, angle_l = al, angle_r = ar, enabled = true })
     else
       errs = errs + 1
       set_status("Analysis failed: " .. tostring(err))
@@ -162,29 +149,34 @@ local function do_suggest()
   end
   busy = nil
   r.Undo_EndBlock("Phase Rotation: suggest", -1)
+  r.UpdateArrange()
   if errs == 0 then
-    set_status(string.format("Suggested rotation for %d item(s) in %.2f s", #items, r.time_precise() - t0))
+    set_status(string.format("Suggested rotation for %d item(s) in %.2f s%s", #items, r.time_precise() - t0,
+      MODE == "source" and " · applied to the source, waveform updated" or " · applied as take FX"))
   end
 end
 
 local function do_bypass()
   local e = items[cur]
   if not e then return end
-  local st = fx_state(e)
+  local st = take_state(e)
   local new_enabled = not (st and st.enabled)
+  r.Undo_BeginBlock()
   for _, it in ipairs(items) do
-    local fx = core.find_fx(it.take)
-    if fx >= 0 then r.TakeFX_SetEnabled(it.take, fx, new_enabled) end
+    if core.get_take_state(it.take) then core.set_take_state(it.take, { enabled = new_enabled }) end
   end
+  r.Undo_EndBlock(new_enabled and "Phase Rotation: enable" or "Phase Rotation: bypass", -1)
+  r.UpdateArrange()
   set_status(new_enabled and "Phase rotation active" or "Bypassed")
 end
 
 local function do_remove()
   r.Undo_BeginBlock()
   local n = 0
-  for _, it in ipairs(items) do if core.remove_fx(it.take) then n = n + 1 end end
-  r.Undo_EndBlock("Phase Rotation: remove FX", -1)
-  set_status(string.format("Removed FX from %d item(s)", n))
+  for _, it in ipairs(items) do if core.clear_take(it.take) then n = n + 1 end end
+  r.Undo_EndBlock("Phase Rotation: reset", -1)
+  r.UpdateArrange()
+  set_status(string.format("Reset %d item(s) to the original", n))
 end
 
 local function stop_preview()
@@ -227,8 +219,8 @@ local function tick_preview()
   if ps & 1 == 0 or r.GetPlayPosition() >= preview.stop_at - 0.02 then stop_preview() end
 end
 
-local function do_render()
-  if #items == 0 then return end
+local function do_render()   -- take-FX mode only: bake the FX into a new take
+  if #items == 0 or MODE ~= "fx" then return end
   stop_preview()
   local list = {}
   for _, e in ipairs(items) do list[#list + 1] = e.item end
@@ -239,34 +231,37 @@ local function do_render()
     or "Nothing to render: press Suggest or move a slider first")
 end
 
-local function set_angle(e, which, v)
+local drag_undo = false
+local function set_angle(e, which, v, final)
   v = max(-180, min(180, v))
-  local fx = e.fx and e.fx >= 0 and e.fx or ensure_fx(e)
-  if not fx then return end
-  if not e.st then core.set_state(e.take, fx, { link = S.link, adaptive = S.adaptive, adapt_ms = S.adapt_ms }) end
   local st = { link = S.link }
+  if not take_state(e) then st.adaptive = S.adaptive; st.smooth = S.smooth end
   if S.link then st.angle_l, st.angle_r = v, v
   elseif which == "l" then st.angle_l = v else st.angle_r = v end
-  core.set_state(e.take, fx, st)
+  if not drag_undo then r.Undo_BeginBlock(); drag_undo = true end
+  set_state(e, st)
+  if final then r.Undo_EndBlock("Phase Rotation: set rotation", -1); drag_undo = false; r.UpdateArrange() end
 end
 
 -- --------------------------------------------------------------------- gfx
 local sc = 1
 local W, H = 760, 330
-local mouse = { x = 0, y = 0, down = false, pdown = false, rdown = false, prdown = false, dbl = false, last_click = 0, cap = 0, wheel = 0 }
+local mouse = { x = 0, y = 0, down = false, pdown = false, dbl = false, last_click = 0, cap = 0, wheel = 0 }
 local active_id, hot_id = nil, nil
 local drag = nil
+local last_slider_apply = 0
 
 local C = {
   bg = { 0.20, 0.21, 0.24 }, panel = { 0.25, 0.26, 0.30 }, line = { 0.33, 0.35, 0.40 },
   text = { 0.92, 0.93, 0.95 }, dim = { 0.60, 0.62, 0.66 }, accent = { 0.40, 0.75, 0.98 },
   accent2 = { 0.98, 0.72, 0.35 }, btn = { 0.31, 0.33, 0.38 }, btn_hot = { 0.38, 0.40, 0.46 },
-  btn_on = { 0.24, 0.50, 0.72 }, danger = { 0.62, 0.30, 0.30 }, good = { 0.45, 0.80, 0.55 },
+  btn_on = { 0.24, 0.50, 0.72 }, good = { 0.45, 0.80, 0.55 }, primary = { 0.30, 0.58, 0.82 }, primary_hot = { 0.36, 0.64, 0.88 },
 }
+local function mix(c, bgc, a) return { c[1] * a + bgc[1] * (1 - a), c[2] * a + bgc[2] * (1 - a), c[3] * a + bgc[3] * (1 - a) } end
 local function col(c, a) gfx.set(c[1], c[2], c[3], a or 1) end
 local function font(sz, flags) gfx.setfont(1, "Arial", floor(sz * sc + 0.5), flags or 0) end
 local function rect(x, y, w, h, fill) gfx.rect(x * sc, y * sc, w * sc, h * sc, fill ~= false and 1 or 0) end
-local function rrect(x, y, w, h, rad)
+local function rrect(x, y, w, h, rad)   -- opaque only (overlapping primitives)
   x, y, w, h, rad = x * sc, y * sc, w * sc, h * sc, rad * sc
   gfx.rect(x + rad, y, w - 2 * rad, h, 1)
   gfx.rect(x, y + rad, w, h - 2 * rad, 1)
@@ -282,21 +277,22 @@ local function inside(x, y, w, h) return mouse.x >= x and mouse.x < x + w and mo
 
 local function button(id, x, y, w, h, label, o)
   o = o or {}
-  local hot = inside(x, y, w, h) and not busy
+  local bgc = o.bar and C.panel or C.bg
+  local hot = inside(x, y, w, h) and not busy and not o.disabled
   if hot then hot_id = id end
   local clicked = false
-  if hot and mouse.down and not mouse.pdown and not o.disabled then active_id = id end
+  if hot and mouse.down and not mouse.pdown then active_id = id end
   if active_id == id and not mouse.down then
-    if hot and not o.disabled then clicked = true end
+    if hot then clicked = true end
     active_id = nil
   end
-  local c = o.on and C.btn_on or (o.primary and { 0.30, 0.58, 0.82 } or C.btn)
-  if hot and not o.disabled then c = o.on and { 0.28, 0.56, 0.80 } or (o.primary and { 0.36, 0.64, 0.88 } or C.btn_hot) end
+  local c = o.on and C.btn_on or (o.primary and C.primary or C.btn)
+  if hot then c = o.on and { 0.28, 0.56, 0.80 } or (o.primary and C.primary_hot or C.btn_hot) end
   if active_id == id then c = { c[1] * 0.8, c[2] * 0.8, c[3] * 0.8 } end
-  col(c, o.disabled and 0.5 or 1)
-  rrect(x, y, w, h, 6)
-  col(C.text, o.disabled and 0.4 or 1)
-  font(14, o.primary and 0 or 0)
+  if o.disabled then c = mix(c, bgc, 0.45) end
+  col(c); rrect(x, y, w, h, 6)
+  col(o.disabled and mix(C.text, bgc, 0.45) or C.text)
+  font(14)
   text(x, y, label, w, h, 1 | 4)
   return clicked
 end
@@ -312,61 +308,50 @@ local function checkbox(id, x, y, label, value, disabled)
     if hot then clicked = true end
     active_id = nil
   end
-  col(hot and C.btn_hot or C.btn, disabled and 0.5 or 1)
-  rrect(x, y, w, w, 4)
-  if value then
-    col(C.accent)
-    rrect(x + 4, y + 4, w - 8, w - 8, 2)
-  end
-  col(C.text, disabled and 0.5 or 1)
+  col(disabled and mix(C.btn, C.bg, 0.5) or (hot and C.btn_hot or C.btn)); rrect(x, y, w, w, 4)
+  if value then col(disabled and mix(C.accent, C.bg, 0.5) or C.accent); rrect(x + 4, y + 4, w - 8, w - 8, 2) end
+  col(disabled and mix(C.text, C.bg, 0.5) or C.text)
   text(x + w + 8, y - 1, label)
   return clicked
 end
 
+-- returns changed, value, final (final = mouse released / wheel / double click)
 local function slider(id, x, y, w, value, disabled)
   local h = 22
   local hot = inside(x - 4, y, w + 8, h) and not busy and not disabled
-  local changed, newv = false, value
-  local knob = x + (value + 180) / 360 * w
+  local changed, newv, final = false, value, false
   if hot and mouse.down and not mouse.pdown then
     active_id = id
-    drag = { id = id, start_v = value, start_x = mouse.x, moved = false }
-    if mouse.dbl then newv = 0; changed = true; drag = nil; active_id = nil end
+    drag = { id = id, start_v = value, start_x = mouse.x }
+    if mouse.dbl then newv = 0; changed = true; final = true; drag = nil; active_id = nil end
   end
   if active_id == id and drag and drag.id == id then
-    if mouse.down then
-      local fine = (mouse.cap & 8) == 8
-      if fine then
-        newv = drag.start_v + (mouse.x - drag.start_x) * 0.1
-      else
-        newv = (mouse.x - x) / w * 360 - 180
-      end
-      newv = max(-180, min(180, newv))
-      newv = floor(newv * 10 + 0.5) / 10
-      if newv ~= value then changed = true end
+    local fine = (mouse.cap & 8) == 8
+    if fine then newv = drag.start_v + (mouse.x - drag.start_x) * 0.1
+    else newv = (mouse.x - x) / w * 360 - 180 end
+    newv = floor(max(-180, min(180, newv)) * 10 + 0.5) / 10
+    if not mouse.down then
+      active_id = nil; drag = nil; changed = true; final = true
     else
-      active_id = nil; drag = nil
-      changed = false; newv = value
-      r.Undo_OnStateChangeEx2(0, "Phase Rotation: set rotation", 2, -1)
+      changed = newv ~= value
     end
   elseif hot and mouse.wheel ~= 0 then
     local step = (mouse.cap & 8) == 8 and 0.1 or 1
     newv = max(-180, min(180, floor((value + (mouse.wheel > 0 and step or -step)) * 10 + 0.5) / 10))
-    changed = newv ~= value
+    changed = newv ~= value; final = true
     mouse.wheel = 0
   end
   -- draw
-  col(C.line, disabled and 0.5 or 1)
-  rrect(x, y + h / 2 - 3, w, 6, 3)
-  col(C.accent, disabled and 0.4 or 0.9)
+  col(disabled and mix(C.line, C.bg, 0.5) or C.line); rrect(x, y + h / 2 - 3, w, 6, 3)
   local cx = x + w / 2
   local kx = x + (newv + 180) / 360 * w
+  col(disabled and mix(C.accent, C.bg, 0.4) or C.accent)
   if kx > cx then rrect(cx, y + h / 2 - 3, kx - cx, 6, 3) else rrect(kx, y + h / 2 - 3, cx - kx, 6, 3) end
   col(C.dim, 0.7); line(cx, y + 2, cx, y + h - 2)
-  col(disabled and C.dim or C.text, disabled and 0.5 or 1)
+  col(disabled and mix(C.text, C.bg, 0.5) or C.text)
   gfx.circle(kx * sc, (y + h / 2) * sc, 8 * sc, 1, 1)
   col(C.bg); gfx.circle(kx * sc, (y + h / 2) * sc, 3 * sc, 1, 1)
-  return changed, newv
+  return changed, newv, final
 end
 
 local function value_box(id, x, y, w, h, v, disabled, fmt)
@@ -379,7 +364,7 @@ local function value_box(id, x, y, w, h, v, disabled, fmt)
   end
   col(C.panel); rrect(x, y, w, h, 4)
   col(hot and C.accent or C.line, 0.9); gfx.roundrect(x * sc, y * sc, w * sc, h * sc, 4 * sc, 1)
-  col(disabled and C.dim or C.text, disabled and 0.6 or 1)
+  col(disabled and mix(C.text, C.panel, 0.6) or C.text)
   font(15)
   text(x, y, string.format(fmt or "%+.1f", v), w, h, 1 | 4)
   return clicked
@@ -388,6 +373,13 @@ end
 local function fmt_time(sec)
   local m = floor(sec / 60)
   return string.format("%d:%05.2f", m, sec - m * 60)
+end
+
+local function current_angles(e, st, res)
+  local live = st and st.mode == "fx" and st.adaptive
+  local al = st and (live and st.cur_l or st.angle_l) or (res and select(1, angles_from_result(res)) or 0)
+  local ar = st and (live and st.cur_r or st.angle_r) or (res and select(2, angles_from_result(res)) or 0)
+  return al, ar
 end
 
 local function draw_plot(x, y, size, e)
@@ -402,21 +394,17 @@ local function draw_plot(x, y, size, e)
     col(C.dim); font(12); text(x, cy - 8, "no analysis yet", size, 16, 1)
     return
   end
-  local shape = {}
-  local mx = 0
+  local shape, mx = {}, 0
   for d = 1, 360 do
-    local v = res.channels[1].shape[d]
-    if res.nch >= 2 then v = max(v, res.channels[2].shape[d]) end
+    local v = res.channels[1].shape[d] or 0
+    if res.nch >= 2 then v = max(v, res.channels[2].shape[d] or 0) end
     shape[d] = v
     if v > mx then mx = v end
   end
   if mx <= 0 then return end
   local st = e.st
-  local theta = 0
-  if st then
-    if st.adaptive then theta = (st.cur_l + (res.nch >= 2 and st.cur_r or st.cur_l)) / 2
-    else theta = (st.angle_l + (res.nch >= 2 and st.angle_r or st.angle_l)) / 2 end
-  end
+  local al, ar = current_angles(e, st, res)
+  local theta = (st and st.enabled ~= false) and (al + (res.nch >= 2 and ar or al)) / 2 or 0
   local function poly(rot, c, a)
     col(c, a)
     local px, py
@@ -431,23 +419,16 @@ local function draw_plot(x, y, size, e)
   end
   poly(0, C.dim, 0.55)
   poly(theta, C.accent, 1)
-  -- horizontal extent = peak of the waveform
-  local pb = res.peak_before / mx * R
-  local pa = (st and st.enabled ~= false) and core.peaks_after(res.bins[1], theta) or 0
-  if res.nch >= 2 then
-    local p2 = core.peaks_after(res.bins[2], theta)
-    pa = max(pa, p2)
+  -- vertical guides = positive / negative peak before (grey) and now (orange)
+  local pb, nb = 0, 0
+  for c = 1, res.nch do pb = max(pb, res.channels[c].pos_before); nb = max(nb, res.channels[c].neg_before) end
+  col(C.dim, 0.6); line(cx + pb / mx * R, y + 6, cx + pb / mx * R, y + size - 6); line(cx - nb / mx * R, y + 6, cx - nb / mx * R, y + size - 6)
+  local pa, na = 0, 0
+  for c = 1, res.nch do
+    local p_, n_ = core.peaks_after_shape(res.channels[c].shape, theta)
+    pa, na = max(pa, p_), max(na, n_)
   end
-  local nb = res.nch >= 2 and max(res.channels[1].neg_before, res.channels[2].neg_before) or res.channels[1].neg_before
-  local pbp = (res.nch >= 2 and max(res.channels[1].pos_before, res.channels[2].pos_before) or res.channels[1].pos_before) / mx * R
-  col(C.dim, 0.6)
-  line(cx + pbp, y + 6, cx + pbp, y + size - 6); line(cx - nb / mx * R, y + 6, cx - nb / mx * R, y + size - 6)
-  local _, pn1 = core.peaks_after(res.bins[1], theta)
-  local pp = pa / mx * R
-  local pn = pn1
-  if res.nch >= 2 then local _, pn2 = core.peaks_after(res.bins[2], theta); pn = max(pn1, pn2) end
-  col(C.accent2, 0.9)
-  line(cx + pp, y + 6, cx + pp, y + size - 6); line(cx - pn / mx * R, y + 6, cx - pn / mx * R, y + size - 6)
+  col(C.accent2, 0.9); line(cx + pa / mx * R, y + 6, cx + pa / mx * R, y + size - 6); line(cx - na / mx * R, y + 6, cx - na / mx * R, y + size - 6)
 end
 
 local function draw_progress()
@@ -461,33 +442,30 @@ end
 
 local function open_settings_menu()
   local m = {
-    (S.keep_original and "!" or "") .. "Render: keep the original as a take (uncheck to crop to the rendered take)",
-    (S.solo_preview and "!" or "") .. "Preview: solo the item's track",
-    ">Adaptive response",
-    (S.adapt_ms == 100 and "!" or "") .. "100 ms",
-    (S.adapt_ms == 250 and "!" or "") .. "250 ms",
-    (S.adapt_ms == 500 and "!" or "") .. "500 ms",
-    (S.adapt_ms == 1000 and "!" or "") .. "1000 ms",
-    "<" .. (S.adapt_ms == 2000 and "!" or "") .. "2000 ms",
     ">Suggest criterion",
     (S.criterion == "rx" and "!" or "") .. "RX-compatible (minimise sum |y|^8, same numbers as iZotope RX)",
     "<" .. (S.criterion == "peak" and "!" or "") .. "Minimum sample peak (most headroom)",
-    "Open JSFX window for this item",
-    "|About / GitHub page",
+    ">Adaptive smoothing",
+    (S.smooth == 0 and "!" or "") .. "Off",
+    (S.smooth == 1 and "!" or "") .. "Light (median of 3 blocks)",
+    "<" .. (S.smooth == 2 and "!" or "") .. "Strong (median of 5 blocks)",
+    (S.solo_preview and "!" or "") .. "Preview: solo the item's track",
   }
+  if MODE == "fx" then
+    m[#m + 1] = (S.keep_original and "!" or "") .. "Render: keep the original as a take (uncheck to crop to the rendered take)"
+    m[#m + 1] = "Open JSFX window for this item"
+  end
+  m[#m + 1] = "|About / GitHub page"
   gfx.x, gfx.y = mouse.x * sc, mouse.y * sc
   local sel = gfx.showmenu(table.concat(m, "|"))
-  if sel == 1 then S.keep_original = not S.keep_original
-  elseif sel == 2 then S.solo_preview = not S.solo_preview
-  elseif sel >= 3 and sel <= 7 then
-    S.adapt_ms = ({ 100, 250, 500, 1000, 2000 })[sel - 2]
-    apply_mode_to_all()
-  elseif sel == 8 or sel == 9 then
-    S.criterion = sel == 8 and "rx" or "peak"
-  elseif sel == 10 then
+  if sel == 1 or sel == 2 then S.criterion = sel == 1 and "rx" or "peak"
+  elseif sel >= 3 and sel <= 5 then S.smooth = sel - 3; apply_mode_to_all()
+  elseif sel == 6 then S.solo_preview = not S.solo_preview
+  elseif MODE == "fx" and sel == 7 then S.keep_original = not S.keep_original
+  elseif MODE == "fx" and sel == 8 then
     local e = items[cur]
-    if e then local fx = ensure_fx(e) if fx then r.TakeFX_Show(e.take, fx, 3) end end
-  elseif sel == 11 then
+    if e then local fx = core.ensure_fx(e.take) if fx >= 0 then r.TakeFX_Show(e.take, fx, 3) end end
+  elseif (MODE == "fx" and sel == 9) or (MODE ~= "fx" and sel == 7) then
     local url = "https://github.com/dennech/reaper-phase-rotation"
     if r.CF_ShellExecute then r.CF_ShellExecute(url) else os.execute('open "' .. url .. '"') end
   end
@@ -497,16 +475,16 @@ end
 draw = function()
   col(C.bg); rect(0, 0, W, H)
   local e = items[cur]
-  local st = e and fx_state(e) or nil
+  local st = e and take_state(e) or nil
   local no_items = #items == 0
-  local adaptive_live = st and st.adaptive
+  local adaptive_live = st and st.adaptive and st.mode == "fx"
 
   -- header row
   if button("suggest", 16, 16, 112, 32, "Suggest", { primary = true, disabled = no_items }) then do_suggest() end
   if checkbox("adaptive", 146, 22, "Adaptive phase rotation", S.adaptive, no_items) then
-    S.adaptive = not S.adaptive; save_settings(); apply_mode_to_all()
+    S.adaptive = not S.adaptive; save_settings()
+    r.Undo_BeginBlock(); apply_mode_to_all(); r.Undo_EndBlock("Phase Rotation: adaptive", -1); r.UpdateArrange()
   end
-  -- item navigator
   font(13); col(C.dim)
   if #items > 1 then
     text(W - 214, 24, string.format("Item %d / %d", cur, #items), 90, 20, 1 | 4)
@@ -516,35 +494,39 @@ draw = function()
   if button("settings", W - 52, 18, 36, 28, "...", {}) then open_settings_menu() end
 
   -- sliders
-  local disabled = no_items or adaptive_live
-  local al = st and (adaptive_live and st.cur_l or st.angle_l) or (e and e.res and select(1, angles_from_result(e.res)) or 0)
-  local ar = st and (adaptive_live and st.cur_r or st.angle_r) or (e and e.res and select(2, angles_from_result(e.res)) or 0)
+  local disabled = no_items or (st and st.adaptive) or false
+  local al, ar = current_angles(e, st, e and e.res)
   local stereo = e and e.info.nch >= 2
   font(15); col(C.dim)
   text(16, 72, "Left rotation [°]")
   text(322, 72, stereo and "Right rotation [°]" or "Right rotation [°]  (mono item)")
-  local chg, nv = slider("sl_l", 16, 96, 176, al, disabled)
-  if chg and e then set_angle(e, "l", nv) end
+  local chg, nv, fin = slider("sl_l", 16, 96, 176, al, disabled)
+  if chg and e then
+    local now = r.time_precise()
+    if fin or now - last_slider_apply > 0.06 then set_angle(e, "l", nv, fin); last_slider_apply = now end
+  end
   if value_box("vb_l", 200, 96, 58, 22, al, disabled) and e then
     local okv, s = r.GetUserInputs("Left rotation", 1, "Degrees (-180 .. 180)", string.format("%.1f", al))
-    if okv and tonumber(s) then set_angle(e, "l", tonumber(s)) end
+    if okv and tonumber(s) then set_angle(e, "l", tonumber(s), true) end
   end
   if button("link", 266, 94, 46, 26, "Link", { on = S.link, disabled = no_items }) then
     S.link = not S.link; save_settings()
+    r.Undo_BeginBlock()
     for _, it in ipairs(items) do
-      local fx = core.find_fx(it.take)
-      if fx >= 0 then
-        local s2 = core.get_state(it.take, fx)
-        core.set_state(it.take, fx, { link = S.link, angle_l = s2.angle_l, angle_r = S.link and s2.angle_l or s2.angle_r })
-      end
+      local s2 = core.get_take_state(it.take)
+      if s2 then core.set_take_state(it.take, { link = S.link, angle_l = s2.angle_l, angle_r = S.link and s2.angle_l or s2.angle_r }) end
     end
+    r.Undo_EndBlock("Phase Rotation: link", -1); r.UpdateArrange()
   end
   local disabled_r = disabled or not stereo
-  chg, nv = slider("sl_r", 322, 96, 176, ar, disabled_r)
-  if chg and e then set_angle(e, "r", nv) end
+  chg, nv, fin = slider("sl_r", 322, 96, 176, ar, disabled_r)
+  if chg and e then
+    local now = r.time_precise()
+    if fin or now - last_slider_apply > 0.06 then set_angle(e, "r", nv, fin); last_slider_apply = now end
+  end
   if value_box("vb_r", 506, 96, 58, 22, ar, disabled_r) and e then
     local okv, s = r.GetUserInputs("Right rotation", 1, "Degrees (-180 .. 180)", string.format("%.1f", ar))
-    if okv and tonumber(s) then set_angle(e, "r", tonumber(s)) end
+    if okv and tonumber(s) then set_angle(e, "r", tonumber(s), true) end
   end
 
   -- info block
@@ -557,24 +539,20 @@ draw = function()
     text(16, 146, string.format("%s   ·   %s   ·   %d Hz   ·   %s", name, inf.nch >= 2 and "stereo" or "mono", floor(inf.sr + 0.5), fmt_time(inf.length)))
     if e.res then
       local res = e.res
-      local theta_l, theta_r = al, ar
       local pa_pos, pa_neg = 0, 0
       for c = 1, res.nch do
-        local p, n = core.peaks_after(res.bins[c], c == 1 and theta_l or theta_r)
+        local p, n = core.peaks_after_shape(res.channels[c].shape, c == 1 and al or ar)
         pa_pos, pa_neg = max(pa_pos, p), max(pa_neg, n)
       end
       local pa = max(pa_pos, pa_neg)
       local gain = core.db(res.peak_before) - core.db(pa)
       col(C.dim); text(16, 170, "Peak")
-      col(C.text)
-      text(60, 170, string.format("%s dBFS  →  %s dBFS", core.fmt_db(res.peak_before), core.fmt_db(pa)))
-      col(gain > 0.05 and C.good or C.dim)
-      text(250, 170, string.format("%+.2f dB headroom", gain))
+      col(C.text); text(60, 170, string.format("%s dBFS  →  %s dBFS", core.fmt_db(res.peak_before), core.fmt_db(pa)))
+      col(gain > 0.05 and C.good or C.dim); text(250, 170, string.format("%+.2f dB headroom", gain))
       col(C.dim); text(16, 192, "Pos / Neg")
-      col(C.text)
-      local pb = res.nch >= 2 and max(res.channels[1].pos_before, res.channels[2].pos_before) or res.channels[1].pos_before
-      local nb = res.nch >= 2 and max(res.channels[1].neg_before, res.channels[2].neg_before) or res.channels[1].neg_before
-      text(90, 192, string.format("%s / %s dBFS  →  %s / %s dBFS", core.fmt_db(pb), core.fmt_db(nb), core.fmt_db(pa_pos), core.fmt_db(pa_neg)))
+      local pb, nb = 0, 0
+      for c = 1, res.nch do pb = max(pb, res.channels[c].pos_before); nb = max(nb, res.channels[c].neg_before) end
+      col(C.text); text(90, 192, string.format("%s / %s dBFS  →  %s / %s dBFS", core.fmt_db(pb), core.fmt_db(nb), core.fmt_db(pa_pos), core.fmt_db(pa_neg)))
       col(C.dim)
       local sug = res.nch >= 2 and (S.link and string.format("linked %+.1f°", res.linked.angle) or string.format("L %+.1f°  R %+.1f°", res.channels[1].best_angle, res.channels[2].best_angle)) or string.format("%+.1f°", res.linked.angle)
       text(16, 214, string.format("Suggested (%s): %s   (analysis %.2f s)", res.criterion == "peak" and "min peak" or "RX-style", sug, res.seconds))
@@ -583,40 +561,44 @@ draw = function()
     end
     if st then
       col(st.enabled and C.accent or C.accent2)
-      text(16, 236, st.enabled and (adaptive_live and "Take FX active · adaptive rotation follows the signal" or "Take FX active (non-destructive) · press Render to bake it in")
-        or "Take FX bypassed")
-    elseif e.res then
-      col(C.dim); text(16, 236, "No take FX yet: move a slider or press Suggest to apply the rotation live")
+      local msg
+      if not st.enabled then msg = "Bypassed"
+      elseif MODE == "source" then msg = st.adaptive and "Applied to the source (adaptive) · non-destructive, waveform shows the result" or "Applied to the source · non-destructive, waveform shows the result"
+      else msg = adaptive_live and "Take FX active · adaptive rotation follows the signal" or "Take FX active (non-destructive) · Render bakes it into a new take" end
+      text(16, 236, msg)
     end
   else
     col(C.dim); text(16, 146, "Select one or more audio items in the arrange view.")
   end
 
   draw_plot(W - 168, 64, 152, e)
-  font(12); col(C.dim); text(W - 168, 220, "envelope vs. phase · grey = before · blue = now", 152, 14, 1)
+  font(11); col(C.dim); text(W - 168, 220, "envelope vs phase", 152, 14, 1); text(W - 168, 233, "grey = original · blue = now", 152, 14, 1)
 
   -- bottom bar
   col(C.panel); rect(0, H - 60, W, 60)
-  local has_fx = st ~= nil
-  if button("preview", 16, H - 46, 96, 32, preview.on and "Stop" or "Preview", { on = preview.on, disabled = no_items }) then
+  local has = st ~= nil
+  if button("preview", 16, H - 46, 96, 32, preview.on and "Stop" or "Preview", { on = preview.on, disabled = no_items, bar = true }) then
     if preview.on then stop_preview() else start_preview() end
   end
-  if button("bypass", 118, H - 46, 88, 32, "Bypass", { on = st and not st.enabled, disabled = not has_fx }) then do_bypass() end
-  if button("remove", 212, H - 46, 100, 32, "Remove FX", { disabled = not has_fx }) then do_remove() end
-  if button("render", W - 126, H - 46, 110, 32, "Render", { primary = true, disabled = not has_fx }) then do_render() end
+  if button("bypass", 118, H - 46, 88, 32, "Bypass", { on = st and not st.enabled, disabled = not has, bar = true }) then do_bypass() end
+  if button("remove", 212, H - 46, 100, 32, MODE == "source" and "Reset" or "Remove FX", { disabled = not has, bar = true }) then do_remove() end
+  if MODE == "fx" then
+    if button("render", W - 126, H - 46, 110, 32, "Render", { primary = true, disabled = not has, bar = true }) then do_render() end
+  end
+  font(12); col(C.dim)
+  text(W - 250, H - 16, MODE == "source" and "engine: source (reaper_phaserot)" or "engine: take FX · install reaper_phaserot for waveform display", 236, 14, 2)
   if status ~= "" then
     col(C.dim); font(13)
-    text(324, H - 40, status, W - 324 - 136, 20, 4)
+    text(324, H - 44, status, W - 324 - 20, 20, 4)
   end
   draw_progress()
 end
 
 -- --------------------------------------------------------------------- loop
 local function read_mouse()
-  mouse.pdown, mouse.prdown = mouse.down, mouse.rdown
+  mouse.pdown = mouse.down
   mouse.cap = gfx.mouse_cap
   mouse.down = (mouse.cap & 1) == 1
-  mouse.rdown = (mouse.cap & 2) == 2
   mouse.x, mouse.y = gfx.mouse_x / sc, gfx.mouse_y / sc
   mouse.dbl = false
   if mouse.down and not mouse.pdown then
@@ -644,7 +626,7 @@ local function test_log(msg)
   if f then f:write(msg, "\n") f:close() end
 end
 local function run_test_action(a)
-  test_log("action " .. a .. " items=" .. #items .. " cur=" .. cur)
+  test_log("action " .. a .. " items=" .. #items .. " cur=" .. cur .. " mode=" .. MODE)
   if a == "suggest" then do_suggest()
   elseif a == "bypass" then do_bypass()
   elseif a == "render" then do_render()
@@ -653,18 +635,20 @@ local function run_test_action(a)
   elseif a == "adaptive" then S.adaptive = not S.adaptive; apply_mode_to_all()
   elseif a == "next" then cur = cur < #items and cur + 1 or 1
   elseif a == "preview" then if preview.on then stop_preview() else start_preview() end
-  elseif a:match("^angle=") then local e = items[cur] if e then set_angle(e, "l", tonumber(a:sub(7))) end
+  elseif a:match("^angle=") then local e = items[cur] if e then set_angle(e, "l", tonumber(a:sub(7)), true) end
   elseif a == "dump" then
     local e = items[cur]
-    local st = e and fx_state(e)
-    test_log(string.format("dump cur=%d fx=%s L=%s R=%s link=%s adaptive=%s enabled=%s res=%s", cur,
-      tostring(e and e.fx), st and st.angle_l or "-", st and st.angle_r or "-", tostring(st and st.link),
-      tostring(st and st.adaptive), tostring(st and st.enabled), e and e.res and string.format("%.3f", e.res.linked.angle) or "-"))
+    local st = e and take_state(e)
+    test_log(string.format("dump cur=%d mode=%s L=%s R=%s adaptive=%s enabled=%s res=%s", cur, MODE,
+      st and st.angle_l or "-", st and st.angle_r or "-", tostring(st and st.adaptive), tostring(st and st.enabled),
+      e and e.res and string.format("%.3f", e.res.linked.angle) or "-"))
   elseif a == "quit" then return "quit" end
 end
 
-local function main()
+local main
+local function main_body()
   frame = frame + 1
+  if frame == 1 or frame == 2 or frame == 14 then test_log("frame " .. frame) end
   if TEST_ACTIONS and frame % 15 == 0 and #test_queue > 0 then
     local a = table.remove(test_queue, 1)
     local okA, res = xpcall(run_test_action, debug.traceback, a)
@@ -689,12 +673,21 @@ local function main()
   else
     draw()
   end
-  if mouse.wheel ~= 0 then mouse.wheel = 0 end
+  mouse.wheel = 0
   gfx.update()
   r.defer(main)
 end
+main = function()
+  if TEST_LOG then
+    local okM, errM = xpcall(main_body, debug.traceback)
+    if not okM then test_log("ERROR " .. tostring(errM)) end
+  else
+    main_body()
+  end
+end
 
 local function init()
+  test_log("init: mode=" .. MODE .. " items_selected=" .. r.CountSelectedMediaItems(0))
   gfx.ext_retina = 1
   local d, x, y, w, h = 0, -1, -1, W, H
   local saved = r.GetExtState(SECTION, "wnd")
@@ -707,15 +700,19 @@ local function init()
     local _, _, sw, sh = r.my_getViewport(0, 0, 0, 0, 0, 0, 0, 0, true)
     x, y = floor((sw - W) / 2), floor((sh - H) / 2)
   end
+  test_log(string.format("init: gfx.init dock=%d pos=%d,%d size=%dx%d", d, x, y, w, h))
   gfx.init(TITLE, w, h, d, x, y)
+  test_log("init: gfx.init done, w=" .. gfx.w .. " h=" .. gfx.h .. " retina=" .. tostring(gfx.ext_retina))
   sc = gfx.ext_retina > 1 and gfx.ext_retina or 1
   if gfx.w / sc ~= W or gfx.h / sc ~= H then W, H = max(600, gfx.w / sc), max(300, gfx.h / sc) end
   refresh_items(true)
+  test_log("init: refresh done, items=" .. #items)
   set_status(#items > 0 and "Press Suggest (S) to analyze, Space to preview" or "")
 end
 
 r.atexit(function()
   stop_preview()
+  if drag_undo then r.Undo_EndBlock("Phase Rotation: set rotation", -1) end
   save_window()
   save_settings()
   gfx.quit()

@@ -1,0 +1,71 @@
+name: build-extension
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+    paths: ['extension/**', '.github/workflows/build.yml']
+  pull_request:
+    paths: ['extension/**']
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            name: darwin-universal
+            artifact: reaper_phaserot.dylib
+            cmake_args: -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" -DCMAKE_OSX_DEPLOYMENT_TARGET=10.13
+          - os: windows-2022
+            name: win64
+            artifact: reaper_phaserot.dll
+            cmake_args: -A x64
+          - os: ubuntu-22.04
+            name: linux-x86_64
+            artifact: reaper_phaserot.so
+            cmake_args: ""
+          - os: ubuntu-22.04-arm
+            name: linux-aarch64
+            artifact: reaper_phaserot.so
+            cmake_args: ""
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -S extension -B extension/build -DCMAKE_BUILD_TYPE=Release ${{ matrix.cmake_args }}
+      - name: Build
+        run: cmake --build extension/build --config Release
+      - name: Collect
+        shell: bash
+        run: |
+          mkdir -p dist
+          f=$(find extension/build -name "${{ matrix.artifact }}" | head -1)
+          cp "$f" "dist/reaper_phaserot-${{ matrix.name }}${{ matrix.artifact }}"
+          # rename to <name>.<ext>
+          ext="${{ matrix.artifact }}"; ext="${ext##*.}"
+          mv "dist/reaper_phaserot-${{ matrix.name }}${{ matrix.artifact }}" "dist/reaper_phaserot-${{ matrix.name }}.$ext"
+          ls -la dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: reaper_phaserot-${{ matrix.name }}
+          path: dist/*
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

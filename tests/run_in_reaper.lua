@@ -109,7 +109,7 @@ local ok, err = xpcall(function()
     local item = items.adaptive_switch
     local take = reaper.GetActiveTake(item)
     local fx = core.ensure_fx(take)
-    core.set_state(take, fx, { link = true, adaptive = true, adapt_ms = 250, angle_l = 0, angle_r = 0 })
+    core.set_state(take, fx, { link = true, adaptive = true, smooth = 0, angle_l = 0, angle_r = 0 })
     core.render({ item }, { keep_original = true })
     result("adaptive_switch.adaptive_render", rendered_path(item))
   end
