@@ -13,6 +13,10 @@ It is the engine behind the *Phase Rotation (RX-style)* script; it has no UI of 
   copy/paste, other scripts). Without the extension the original file plays unprocessed.
 * Adaptive mode: the angle minimising the peak is estimated per 43 ms sub-block and
   interpolated between sub-block centres (computed once per take, deterministic).
+* REAPER caches the drawn peaks of an item and does not re-read them when the take's
+  source object changes, so after every wrap / parameter change / reset the extension
+  triggers "Peaks: Build any missing peaks" (action 40047), which makes the arrange view
+  re-request peaks (measured to be the cheapest reliable trigger).
 
 ## ReaScript API
 
@@ -24,6 +28,7 @@ It is the engine behind the *Phase Rotation (RX-style)* script; it has no UI of 
 | `boolean PhaseRot_Analyze(take)` | analyse the original audio; result in `GetExtState("phaserot","analysis")` |
 | `PhaseRot_Refresh()` | re-sync all takes now |
 | `string PhaseRot_GetVersion()` | version |
+| `boolean PhaseRot_GetDebug(take)` | debug counters of the take's wrapper in `GetExtState("phaserot","debug")` |
 
 Wrap calls in `Undo_BeginBlock()` / `Undo_EndBlock()` to make them undoable.
 

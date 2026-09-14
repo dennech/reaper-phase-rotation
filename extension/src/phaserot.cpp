@@ -35,6 +35,7 @@
 #define REAPERAPI_WANT_ShowConsoleMsg
 #define REAPERAPI_WANT_plugin_register
 #define REAPERAPI_WANT_time_precise
+#define REAPERAPI_WANT_Main_OnCommand
 #define REAPERAPI_WANT_SetExtState
 #define REAPERAPI_WANT_GetMediaItemTakeInfo_Value
 #define REAPERAPI_WANT_GetMediaItemInfo_Value
@@ -58,8 +59,9 @@
 #include <mutex>
 #include <string>
 #include <algorithm>
+#include <atomic>
 
-#define PR_VERSION "1.0.1"
+#define PR_VERSION "1.0.2"
 #define PR_EXT_KEY "P_EXT:phaserot"
 #define PR_EXT_IDENTIFY 0x50524f54 /* 'PROT' */
 #define PR_MAGIC 0x50686153     /* 'PhaS' */
@@ -172,6 +174,7 @@ class PhaseRotSource : public PCM_source
 public:
   PhaseRotSource(PCM_source* child, const Params& p) : m_child(child), m_params(p)
   {
+    dbg_created = time_precise();
     std::lock_guard<std::mutex> lk(g_registry_mutex);
     g_registry.push_back(this);
   }
@@ -258,8 +261,13 @@ public:
     return m_child ? m_child->Extended(call, parm1, parm2, parm3) : 0;
   }
 
+  // debug counters (PhaseRot_GetDebug)
+  std::atomic<long> dbg_samples{0}, dbg_peaks{0};
+  double dbg_created = 0;
+
   void GetSamples(PCM_source_transfer_t* block) override
   {
+    dbg_samples++;
     if (!m_child) { block->samples_out = 0; return; }
     Params p; std::shared_ptr<dsp::Trajectory> tr;
     { std::lock_guard<std::mutex> lk(m_mutex); p = m_params; tr = m_traj; }
@@ -273,6 +281,7 @@ public:
 
   void GetPeakInfo(PCM_source_peaktransfer_t* block) override
   {
+    dbg_peaks++;
     block->peaks_out = 0;
     block->extra_requested_data_out = 0;
     block->extra_requested_data_out2 = 0;
@@ -676,21 +685,43 @@ static bool sync_take(MediaItem_Take* take)
       return true;
     }
     PhaseRotSource* w = (PhaseRotSource*)src;
-    if (w->params() != p) { w->set_params(p); return true; }
+    if (w->params() != p) {
+      // REAPER keeps the drawn peaks of a take per source object and does not re-read them
+      // after UpdateItemInProject, so a parameter change swaps in a fresh wrapper around the
+      // same child; the old one is parked in the graveyard until the audio thread is out.
+      PhaseRotSource* w2 = new PhaseRotSource(w->detach(), Params());
+      w2->set_params(p);
+      GetSetMediaItemTakeInfo(take, "P_SOURCE", w2);
+      bury_wrapper(w);
+      return true;
+    }
     return false;
   }
   if (wrapped) {
+    // same reason: give REAPER a fresh copy of the original source so the waveform redraws;
+    // the wrapper keeps (and later frees) the child it was reading from
     PhaseRotSource* w = (PhaseRotSource*)src;
-    PCM_source* child = w->detach();
-    GetSetMediaItemTakeInfo(take, "P_SOURCE", child);
+    PCM_source* fresh = w->child() ? w->child()->Duplicate() : nullptr;
+    if (fresh) GetSetMediaItemTakeInfo(take, "P_SOURCE", fresh);
+    else GetSetMediaItemTakeInfo(take, "P_SOURCE", w->detach());
     bury_wrapper(w);
     return true;
   }
   return false;
 }
 
+// REAPER caches the drawn peaks of an item and does not re-read them after UpdateItemInProject
+// when the take's source object changes. "Peaks: Build any missing peaks" (40047) makes it
+// re-request peaks from every source (cheap: nothing is normally missing) - measured to be the
+// least intrusive trigger; property pokes (volume, mute) would touch user state or the audio.
+static void refresh_peak_display()
+{
+  if (Main_OnCommand) Main_OnCommand(40047, 0);
+}
+
 static void scan_all_projects()
 {
+  bool any = false;
   for (int pi = 0;; pi++) {
     ReaProject* proj = EnumProjects(pi, nullptr, 0);
     if (!proj) break;
@@ -703,9 +734,10 @@ static void scan_all_projects()
         MediaItem_Take* take = GetTake(item, t);
         if (take && sync_take(take)) changed = true;
       }
-      if (changed) UpdateItemInProject(item);
+      if (changed) { UpdateItemInProject(item); any = true; }
     }
   }
+  if (any) refresh_peak_display();
   sweep_graveyard(false);
 }
 
@@ -938,18 +970,20 @@ static bool API_PhaseRot_SetTake(MediaItem_Take* take, double angle_l, double an
   if (!valid_take(take) || TakeIsMIDI(take)) return false;
   Params p; p.angle_l = angle_l; p.angle_r = angle_r; p.adaptive = adaptive ? 1 : 0; p.smooth = std::min(2, std::max(0, smooth)); p.bypass = bypass ? 1 : 0; p.link = link ? 1 : 0;
   take_set_ext(take, &p);
-  sync_take(take);
+  bool changed = sync_take(take);
   MediaItem* item = GetMediaItemTake_Item(take);
   if (item) UpdateItemInProject(item);
+  if (changed) refresh_peak_display();
   return true;
 }
 static bool API_PhaseRot_ClearTake(MediaItem_Take* take)
 {
   if (!valid_take(take)) return false;
   take_set_ext(take, nullptr);
-  sync_take(take);
+  bool changed = sync_take(take);
   MediaItem* item = GetMediaItemTake_Item(take);
   if (item) UpdateItemInProject(item);
+  if (changed) refresh_peak_display();
   return true;
 }
 static bool API_PhaseRot_GetTake(MediaItem_Take* take, double* angle_lOut, double* angle_rOut, int* adaptiveOut, int* smoothOut, int* bypassOut, int* linkOut)
@@ -971,6 +1005,22 @@ static bool API_PhaseRot_Analyze(MediaItem_Take* take)
   return analyze_take(take);
 }
 static void API_PhaseRot_Refresh() { scan_all_projects(); }
+// debug: counters of the take's current wrapper -> ExtState phaserot/debug
+static bool API_PhaseRot_GetDebug(MediaItem_Take* take)
+{
+  if (!valid_take(take)) return false;
+  PCM_source* src = (PCM_source*)GetSetMediaItemTakeInfo(take, "P_SOURCE", nullptr);
+  char b[256];
+  if (PhaseRotSource::is_wrapper(src)) {
+    PhaseRotSource* w = (PhaseRotSource*)src;
+    snprintf(b, sizeof(b), "wrapper=%p peak_calls=%ld sample_calls=%ld age=%.2f", (void*)w, w->dbg_peaks.load(), w->dbg_samples.load(), time_precise() - w->dbg_created);
+  } else {
+    snprintf(b, sizeof(b), "plain=%p type=%s", (void*)src, src ? src->GetType() : "-");
+  }
+  SetExtState("phaserot", "debug", b, false);
+  return true;
+}
+static void* VA_PhaseRot_GetDebug(void** a, int n) { return (void*)(INT_PTR)API_PhaseRot_GetDebug((MediaItem_Take*)a[0]); }
 static const char* API_PhaseRot_GetVersion() { return PR_VERSION; }
 
 // vararg wrappers (ReaScript)
@@ -999,6 +1049,8 @@ static ApiEntry g_api[] = {
     "bool\0MediaItem_Take*,double*,double*,int*,int*,int*,int*\0take,angle_lOut,angle_rOut,adaptiveOut,smoothOut,bypassOut,linkOut\0Get the phase rotation settings of the take. Returns false if the take has none." },
   { "PhaseRot_Analyze", (void*)API_PhaseRot_Analyze, (void*)VA_PhaseRot_Analyze,
     "bool\0MediaItem_Take*\0take\0Analyse the take's ORIGINAL audio (ignoring any phase rotation already applied). The result is stored in the ExtState section 'phaserot', key 'analysis' (read it with GetExtState) as key=value pairs: chN_rx (RX-compatible suggested angle, L8 criterion), chN_peak (minimum sample peak angle), linked_rx, linked_peak, chN_before / chN_after_rx / chN_minpeak (linear peak levels), chN_pos_before, chN_neg_before, chN_pos_after, chN_neg_after, shapeN (360 comma-separated envelope values by phase degree)." },
+  { "PhaseRot_GetDebug", (void*)API_PhaseRot_GetDebug, (void*)VA_PhaseRot_GetDebug,
+    "bool\0MediaItem_Take*\0take\0Debug: writes counters of the take's source wrapper to ExtState phaserot/debug." },
   { "PhaseRot_Refresh", (void*)API_PhaseRot_Refresh, (void*)VA_PhaseRot_Refresh,
     "void\0\0\0Re-synchronise all takes with their P_EXT:phaserot data immediately (normally done automatically by a timer)." },
   { "PhaseRot_GetVersion", (void*)API_PhaseRot_GetVersion, (void*)VA_PhaseRot_GetVersion,

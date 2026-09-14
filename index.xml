@@ -30,13 +30,14 @@
 ]]></description>
         <link rel="website">https://github.com/dennech/reaper-phase-rotation</link>
       </metadata>
-      <version name="1.0.1" author="dennech" time="2026-09-14T20:30:00Z">
-        <changelog><![CDATA[1.0.1: deferred deletion of replaced source wrappers (audio-thread safety), separate decoder for UI reads, no allocations in the audio path, Link for adaptive mode, take-window/channel-mode aware analysis, sources restored on unload.]]></changelog>
-        <source platform="darwin-arm64" file="reaper_phaserot.dylib">https://github.com/dennech/reaper-phase-rotation/releases/download/v1.1.1/reaper_phaserot-darwin-universal.dylib</source>
-        <source platform="darwin-x64" file="reaper_phaserot.dylib">https://github.com/dennech/reaper-phase-rotation/releases/download/v1.1.1/reaper_phaserot-darwin-universal.dylib</source>
-        <source platform="win64" file="reaper_phaserot.dll">https://github.com/dennech/reaper-phase-rotation/releases/download/v1.1.1/reaper_phaserot-win64.dll</source>
-        <source platform="linux-x86_64" file="reaper_phaserot.so">https://github.com/dennech/reaper-phase-rotation/releases/download/v1.1.1/reaper_phaserot-linux-x86_64.so</source>
-        <source platform="linux-aarch64" file="reaper_phaserot.so">https://github.com/dennech/reaper-phase-rotation/releases/download/v1.1.1/reaper_phaserot-linux-aarch64.so</source>
+      <version name="1.0.2" author="dennech" time="2026-09-14T21:30:00Z">
+        <changelog><![CDATA[1.0.2: the arrange view now redraws the waveform after every change (REAPER caches drawn peaks per item; a peak re-read is triggered after each source swap); PhaseRot_GetDebug.
+1.0.1: deferred deletion of replaced source wrappers (audio-thread safety), separate decoder for UI reads, no allocations in the audio path, Link for adaptive mode, take-window/channel-mode aware analysis, sources restored on unload.]]></changelog>
+        <source platform="darwin-arm64" file="reaper_phaserot.dylib">https://github.com/dennech/reaper-phase-rotation/releases/download/v1.1.2/reaper_phaserot-darwin-universal.dylib</source>
+        <source platform="darwin-x64" file="reaper_phaserot.dylib">https://github.com/dennech/reaper-phase-rotation/releases/download/v1.1.2/reaper_phaserot-darwin-universal.dylib</source>
+        <source platform="win64" file="reaper_phaserot.dll">https://github.com/dennech/reaper-phase-rotation/releases/download/v1.1.2/reaper_phaserot-win64.dll</source>
+        <source platform="linux-x86_64" file="reaper_phaserot.so">https://github.com/dennech/reaper-phase-rotation/releases/download/v1.1.2/reaper_phaserot-linux-x86_64.so</source>
+        <source platform="linux-aarch64" file="reaper_phaserot.so">https://github.com/dennech/reaper-phase-rotation/releases/download/v1.1.2/reaper_phaserot-linux-aarch64.so</source>
       </version>
     </reapack>
   </category>
