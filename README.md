@@ -93,8 +93,9 @@ The JSFX can also be used on its own (track FX or take FX) - it has the same con
 * **Rotation**: `y = cos(θ)·x + sin(θ)·H{x}` (RX's sign convention), where `H` is a linear-phase FIR Hilbert
   transformer (Kaiser window, 8193 taps at ≤ 50 kHz, 16385 above), applied by FFT
   overlap-save convolution. Flat to within 0.01 dB from 14 Hz up. At 0° the output is
-  bit-identical to the input; the latency (HOP + FIR delay, 256 ms at 48 kHz) is reported
-  as PDC and fully compensated by REAPER, so nothing shifts in time.
+  bit-identical to the input. In the JSFX the latency (block + one sub-block of look-ahead
+  + FIR delay, about 300 ms at 48 kHz) is reported as PDC and fully compensated by REAPER,
+  so nothing shifts in time; the extension reads ahead itself and has no latency.
 * **Suggest**: the analysis in Lua computes the same Hilbert transform (using REAPER's
   native FFT), builds histograms of the analytic-signal envelope over phase (0.125°
   bins) and searches the angle that minimises `Σ|y|^8` - an L8 norm, i.e. a smooth
@@ -114,7 +115,7 @@ The JSFX can also be used on its own (track FX or take FX) - it has the same con
 * Stereo items are analysed per channel; with **Link** on, one common angle is used
   (like RX). Items with more than two channels: channels 1–2 are processed, the rest pass
   through.
-* Analysis uses the take as it plays (playrate, channel mode), but not other take FX.
+* Analysis uses the part of the source the item plays (start offset, length, play rate) and the take's channel mode, but not other take FX.
 * The peak criterion is a *sample* peak, as in RX. A single click can dominate it - remove
   clicks first, or set the angle by ear.
 * Take-FX engine only: live playback with the JSFX adds ~300 ms of PDC latency; rendering
@@ -131,7 +132,7 @@ touched), runs `tests/run_in_reaper.lua` (JSFX engine: analysis, fixed-angle ren
 alignment, adaptive render, track-FX bypass), `tests/ext_test.lua` (source engine: output
 vs. reference, waveform peaks, undo/redo, duplicate, save/reload, bypass/reset, adaptive)
 and `tests/gui_smoke.lua` (scripted clicks through the real UI), and compares the results
-with the reference: suggested angles match to 0.125°, audio matches to ~1e-6. `tests/RX_REFERENCE.md` documents the comparison with iZotope RX 10
+with the reference: suggested angles agree within 0.35° (the analysis histogram step is 0.125°), audio matches to ~1e-6. `tests/RX_REFERENCE.md` documents the comparison with iZotope RX 10
 (angles, sign convention, rendered audio).
 
 ```bash

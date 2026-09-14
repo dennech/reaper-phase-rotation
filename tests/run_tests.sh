@@ -71,7 +71,7 @@ fi
 echo "---- verify:"; "$PY" "$REPO/tests/reference.py" verify "$SCRATCH/testsignals" "$PR_TEST_OUT"
 
 # ---- GUI smoke test (scripted actions through the real GUI script)
-export PHASE_ROTATION_TEST_LOG="$SCRATCH/gui.log" PHASE_ROTATION_TEST_ACTIONS="dump,suggest,dump,next,dump,angle=12.5,dump,link,angle=-20,dump,bypass,dump,bypass,adaptive,dump,adaptive,preview,preview,render,dump,remove,quit"
+export PHASE_ROTATION_TEST_LOG="$SCRATCH/gui.log" PHASE_ROTATION_TEST_ACTIONS="link_on,dump,suggest,dump,next,dump,angle=12.5,dump,link_off,angle=-20,dump,angle=0,dump,bypass,dump,bypass,adaptive,dump,adaptive,preview,preview,render,dump,remove,quit"
 rm -f "$PHASE_ROTATION_TEST_LOG"
 export PR_TEST_OUT="$SCRATCH/gui_smoke.log" PR_PROJ="$SCRATCH/proj/gui.rpp"
 run_reaper "$REPO/tests/gui_smoke.lua" "$SCRATCH/gui_smoke.log" "gui smoke end"
@@ -79,4 +79,6 @@ echo "---- GUI smoke:"; cat "$SCRATCH/gui_smoke.log"; cat "$PHASE_ROTATION_TEST_
 if grep -q ERROR "$SCRATCH/gui_smoke.log" "$PHASE_ROTATION_TEST_LOG"; then echo "GUI SMOKE FAILED"; exit 1; fi
 # after Suggest the first item (asym_mono) must carry the RX-style angle (+77.6)
 if ! grep -q "res=77.625" "$PHASE_ROTATION_TEST_LOG"; then echo "GUI SMOKE FAILED: Suggest did not produce the expected angle"; exit 1; fi
+# unlinked: L set to 0 after -20 must apply (0 is a valid angle), R keeps its own value
+if ! grep -q "L=0.0 R=12.5" "$PHASE_ROTATION_TEST_LOG"; then echo "GUI SMOKE FAILED: setting 0 degrees did not apply"; exit 1; fi
 echo "ALL TESTS PASSED"

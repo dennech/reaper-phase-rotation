@@ -102,7 +102,6 @@ function setup() local(k, w, i0b, i) (
   pdc_delay = HOP + SUB + DFIR;        // block + one sub-block of look-ahead + FIR delay
   pdc_bot_ch = 0; pdc_top_ch = 2;
   runpk2_l = 0; runpk2_r = 0;
-  coef_manual = 1 - exp(-1 / (0.010 * srate));
 );
 
 
@@ -211,7 +210,7 @@ function smoothed(arr, slot) local(m, f, g) (
   m;
 );
 
-function process_block() local(k, n, j, xl, xr, hl, hr, cl, sl, cr, sr_, o, base, s0l, s1l, s0r, s1r, tl, tr_, step, q) (
+function process_block() local(k, n, j, xl, xr, hl, hr, cl, sl, cr, sr_, o, base, s0l, s1l, s0r, s1r, el, er, tl, tr_, step, half, q) (
   memcpy(FFTBUF, INBUF, 2 * NFFT);
   fft(FFTBUF, NFFT);
   convolve_c(FFTBUF, HSPEC, NFFT);
@@ -232,12 +231,15 @@ function process_block() local(k, n, j, xl, xr, hl, hr, cl, sl, cr, sr_, o, base
   // through the sub-block centres, using one sub-block of look-ahead.
   q = 0;
   loop(NSUB,
-    // slot of the sub-block being output: 3 = previous block's last, 4.. = current block
+    // slot of the sub-block being output: 3 = previous block's last, 4.. = current block.
+    // The angle is piecewise linear through the sub-block centres (same as the extension):
+    // start of sub-block = midpoint of (previous, this), centre = this, end = midpoint of (this, next).
     base = 3 + q;
-    s0l = 0.5 * (smoothed(ESTL, base - 1) + smoothed(ESTL, base)); s1l = 0.5 * (smoothed(ESTL, base) + smoothed(ESTL, base + 1));
-    s0r = 0.5 * (smoothed(ESTR, base - 1) + smoothed(ESTR, base)); s1r = 0.5 * (smoothed(ESTR, base) + smoothed(ESTR, base + 1));
-    !adaptive ? ( s0l = s1l = angle_l; s0r = s1r = angle_r; );
-    step = 1 / SUB;
+    el = smoothed(ESTL, base); er = smoothed(ESTR, base);
+    s0l = 0.5 * (smoothed(ESTL, base - 1) + el); s1l = 0.5 * (el + smoothed(ESTL, base + 1));
+    s0r = 0.5 * (smoothed(ESTR, base - 1) + er); s1r = 0.5 * (er + smoothed(ESTR, base + 1));
+    !adaptive ? ( s0l = s1l = el = angle_l; s0r = s1r = er = angle_r; );
+    half = SUB * 0.5; step = 1 / half;
     n = 0;
     loop(SUB,
       q == 0 ? (
@@ -247,8 +249,13 @@ function process_block() local(k, n, j, xl, xr, hl, hr, cl, sl, cr, sr_, o, base
         xl = INBUF[2 * (j - DFIR)]; xr = INBUF[2 * (j - DFIR) + 1];
         hl = FFTBUF[2 * j];      hr = FFTBUF[2 * j + 1];
       );
-      cur_l = (s0l + (s1l - s0l) * (n + 0.5) * step) * $pi / 180;
-      cur_r = (s0r + (s1r - s0r) * (n + 0.5) * step) * $pi / 180;
+      n < half ? (
+        cur_l = (s0l + (el - s0l) * (n + 0.5) * step) * $pi / 180;
+        cur_r = (s0r + (er - s0r) * (n + 0.5) * step) * $pi / 180;
+      ) : (
+        cur_l = (el + (s1l - el) * (n - half + 0.5) * step) * $pi / 180;
+        cur_r = (er + (s1r - er) * (n - half + 0.5) * step) * $pi / 180;
+      );
       cl = cos(cur_l); sl = sin(cur_l); cr = cos(cur_r); sr_ = sin(cur_r);
       o = 2 * (q * SUB + n);
       OUTBUF[o]     = cl * xl + sl * hl;
@@ -257,7 +264,7 @@ function process_block() local(k, n, j, xl, xr, hl, hr, cl, sl, cr, sr_, o, base
     );
     q += 1;
   );
-  // keep the current block's last sub-block (dry + wet) and the last two estimates for the next block
+  // keep the current block's last sub-block (dry + wet) and its estimates for the next block
   n = 0;
   loop(SUB,
     j = MFIR - 1 + (NSUB - 1) * SUB + n;
@@ -273,9 +280,7 @@ function process_block() local(k, n, j, xl, xr, hl, hr, cl, sl, cr, sr_, o, base
   cur_r_deg = cur_r * 180 / $pi; cur_r_deg = cur_r_deg - 360 * floor((cur_r_deg + 180) / 360);
 );
 
-// ---- top-level @init code (must come after ALL function definitions: EEL2
-// functions defined below the first top-level statement are not visible to
-// other sections) ------------------------------------------------------------
+// ---- top-level @init code (kept after the function definitions) ------------
 setup();
 cur_l = angle_l * $pi / 180; cur_r = angle_r * $pi / 180;
 prev_l = angle_l; prev_r = angle_r;

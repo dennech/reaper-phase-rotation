@@ -1,6 +1,6 @@
 -- @description Phase Rotation (RX-style): suggest, audition and apply broadband phase rotation to selected items
 -- @author dennech
--- @version 1.1.0
+-- @version 1.1.1
 -- @provides
 --   [nomain] phase_rotation_core.lua
 --   [effect] phase_rotation.jsfx
@@ -230,6 +230,17 @@ local function do_render()   -- take-FX mode only: bake the FX into a new take
   set_status(n > 0 and string.format("Rendered %d item(s)%s", n, S.keep_original and " (original kept as a take)" or "")
     or "Nothing to render: press Suggest or move a slider first")
 end
+
+local function set_link(v)
+  S.link = v; save_settings()
+  r.Undo_BeginBlock()
+  for _, it in ipairs(items) do
+    local s2 = core.get_take_state(it.take)
+    if s2 then core.set_take_state(it.take, { link = S.link, angle_l = s2.angle_l, angle_r = S.link and s2.angle_l or s2.angle_r }) end
+  end
+  r.Undo_EndBlock("Phase Rotation: link", -1); r.UpdateArrange()
+end
+local function toggle_link() set_link(not S.link) end
 
 local drag_undo = false
 local function set_angle(e, which, v, final)
@@ -467,7 +478,13 @@ local function open_settings_menu()
     if e then local fx = core.ensure_fx(e.take) if fx >= 0 then r.TakeFX_Show(e.take, fx, 3) end end
   elseif (MODE == "fx" and sel == 9) or (MODE ~= "fx" and sel == 7) then
     local url = "https://github.com/dennech/reaper-phase-rotation"
-    if r.CF_ShellExecute then r.CF_ShellExecute(url) else os.execute('open "' .. url .. '"') end
+    if r.CF_ShellExecute then r.CF_ShellExecute(url)
+    else
+      local os_name = r.GetOS()
+      if os_name:match("^Win") then os.execute('start "" "' .. url .. '"')
+      elseif os_name:match("^OSX") or os_name:match("^macOS") then os.execute('open "' .. url .. '"')
+      else os.execute('xdg-open "' .. url .. '" &') end
+    end
   end
   save_settings()
 end
@@ -509,15 +526,7 @@ draw = function()
     local okv, s = r.GetUserInputs("Left rotation", 1, "Degrees (-180 .. 180)", string.format("%.1f", al))
     if okv and tonumber(s) then set_angle(e, "l", tonumber(s), true) end
   end
-  if button("link", 266, 94, 46, 26, "Link", { on = S.link, disabled = no_items }) then
-    S.link = not S.link; save_settings()
-    r.Undo_BeginBlock()
-    for _, it in ipairs(items) do
-      local s2 = core.get_take_state(it.take)
-      if s2 then core.set_take_state(it.take, { link = S.link, angle_l = s2.angle_l, angle_r = S.link and s2.angle_l or s2.angle_r }) end
-    end
-    r.Undo_EndBlock("Phase Rotation: link", -1); r.UpdateArrange()
-  end
+  if button("link", 266, 94, 46, 26, "Link", { on = S.link, disabled = no_items }) then toggle_link() end
   local disabled_r = disabled or not stereo
   chg, nv, fin = slider("sl_r", 322, 96, 176, ar, disabled_r)
   if chg and e then
@@ -631,7 +640,9 @@ local function run_test_action(a)
   elseif a == "bypass" then do_bypass()
   elseif a == "render" then do_render()
   elseif a == "remove" then do_remove()
-  elseif a == "link" then S.link = not S.link
+  elseif a == "link" then toggle_link()
+  elseif a == "link_on" then set_link(true)
+  elseif a == "link_off" then set_link(false)
   elseif a == "adaptive" then S.adaptive = not S.adaptive; apply_mode_to_all()
   elseif a == "next" then cur = cur < #items and cur + 1 or 1
   elseif a == "preview" then if preview.on then stop_preview() else start_preview() end

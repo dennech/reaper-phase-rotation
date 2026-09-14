@@ -13,7 +13,7 @@
 local r = reaper
 local core = {}
 
-core.VERSION = "1.0.0"
+core.VERSION = "1.1.1"
 core.SECTION = "dennech_PhaseRotation"           -- ExtState section
 core.JSFX_FILE = "phase_rotation.jsfx"
 core.FX_DESC = "Phase Rotation (RX-style, Hilbert)"
@@ -582,20 +582,21 @@ function core.mode()
 end
 
 function core.ext_get(take)
-  local ok, al, ar, ad, sm, by = r.PhaseRot_GetTake(take, 0, 0, 0, 0, 0)
+  local ok, al, ar, ad, sm, by, li = r.PhaseRot_GetTake(take, 0, 0, 0, 0, 0, 0)
   if not ok then return nil end
-  return { angle_l = al, angle_r = ar, adaptive = ad ~= 0, smooth = sm, enabled = by == 0, mode = "source" }
+  return { angle_l = al, angle_r = ar, adaptive = ad ~= 0, smooth = sm, enabled = by == 0, link = li ~= 0, mode = "source" }
 end
 
 -- st fields optional (merged with the current state): angle_l, angle_r, adaptive, smooth, enabled
 function core.ext_set(take, st)
-  local cur = core.ext_get(take) or { angle_l = 0, angle_r = 0, adaptive = false, smooth = 0, enabled = true }
+  local cur = core.ext_get(take) or { angle_l = 0, angle_r = 0, adaptive = false, smooth = 0, enabled = true, link = true }
   local al = st.angle_l or cur.angle_l
   local ar = st.angle_r or cur.angle_r
   local ad = st.adaptive; if ad == nil then ad = cur.adaptive end
   local sm = st.smooth or cur.smooth or 0
   local en = st.enabled; if en == nil then en = cur.enabled end
-  return r.PhaseRot_SetTake(take, al, ar, ad and 1 or 0, sm, en and 0 or 1)
+  local li = st.link; if li == nil then li = cur.link end
+  return r.PhaseRot_SetTake(take, al, ar, ad and 1 or 0, sm, en and 0 or 1, li and 1 or 0)
 end
 
 function core.ext_clear(take)
@@ -672,7 +673,10 @@ function core.get_take_state(take)
 end
 
 function core.set_take_state(take, st)
-  if core.mode() == "source" then return core.ext_set(take, st) end
+  if core.mode() == "source" then
+    core.remove_fx(take)   -- a take FX left over from the JSFX engine would rotate twice
+    return core.ext_set(take, st)
+  end
   local fx, err = core.ensure_fx(take)
   if fx < 0 then return false, err end
   core.set_state(take, fx, st)
@@ -680,8 +684,12 @@ function core.set_take_state(take, st)
 end
 
 function core.clear_take(take)
-  if core.mode() == "source" then return core.ext_clear(take) end
-  return core.remove_fx(take)
+  local a = core.remove_fx(take)
+  if core.mode() == "source" then
+    local b = core.ext_clear(take)
+    return a or b
+  end
+  return a
 end
 
 function core.analyze_any(take, opts, progress)

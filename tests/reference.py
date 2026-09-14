@@ -15,6 +15,8 @@ verified against RX 10 renders, see RX_REFERENCE.md):
 
     y = cos(theta) * x + sin(theta) * H{x}
 
+(the older draft used a minus sign; every implementation now uses plus)
+
 so for x = cos(w t) the output is cos(w t - theta).
 
 Suggest criterion: RX's "Suggest" is reproduced by minimising the L8 norm
@@ -35,7 +37,7 @@ import numpy as np
 from scipy.io import wavfile
 
 BETA = 8.0
-THR_REL = 0.5          # only samples with envelope >= THR_REL * max envelope matter for the peak
+THR_REL = 0.5          # only samples with envelope >= THR_REL * max envelope can be the peak (Lua/C++ use 0.1 for both criteria; same result, more candidates)
 TIE_TOL_DB = 0.01      # prefer the smallest rotation that is within this of the best peak
 
 
@@ -412,7 +414,12 @@ def verify(outdir, logpath):
 
     if "trackfx_bypass_peak" in results:
         pk = float(results["trackfx_bypass_peak"])
-        check("track FX bypassed during render", pk > 0.30, f"peak {pk:.3f} (about 0.4-0.5 expected, half of that if track FX leaked)")
+        check("track FX bypassed during render", pk > 0.36, f"peak {pk:.3f} (0.39 expected at +90 deg, half of that if track FX leaked)")
+    if "asym_mono.roundtrip_angle" in results:
+        rt = float(results["asym_mono.roundtrip_angle"])
+        check("roundtrip: re-analysing the rendered item suggests ~0 deg", abs(rt) <= 1.5, f"got {rt:.3f}")
+        got = float(results["asym_mono.roundtrip_peak_before_db"]); exp = float(results["asym_mono.roundtrip_expected_peak_db"])
+        check("roundtrip: rendered peak equals the predicted peak", abs(got - exp) <= 0.1, f"got {got:.2f} predicted {exp:.2f}")
     if "trackfx_enabled_after" in results:
         check("track FX re-enabled after render", results["trackfx_enabled_after"] == "true", results["trackfx_enabled_after"])
     # ---- reaper_phaserot extension (source wrapper) checks

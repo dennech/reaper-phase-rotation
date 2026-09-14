@@ -5,14 +5,15 @@
       <metadata>
         <description><![CDATA[{\rtf1\ansi\deff0{\fonttbl{\f0 \fswiss Helvetica;}}
 {\pard \ql \f0 \sa180 \li0 \fi0 {\b Phase Rotation (RX-style)} - a REAPER re-creation of the iZotope RX "Phase" module for media items.\par}
-{\pard \ql \f0 \sa180 \li0 \fi0 Suggest finds the channel-linked fixed rotation that minimises the peak level of the selected items; Left/Right rotation sliders with Link; Adaptive phase rotation; Preview / Bypass; Render bakes the rotation into a new take. Processing is done by the bundled JSFX "Phase Rotation (RX-style, Hilbert)" (linear-phase FIR Hilbert transformer, 0 degrees = bit-transparent), inserted as a take FX so everything stays non-destructive until you press Render.\par}
+{\pard \ql \f0 \sa180 \li0 \fi0 Suggest reproduces iZotope RX 10's own values (verified against RX renders); Left/Right rotation sliders with Link; Adaptive phase rotation; Preview / Bypass. With the reaper_phaserot extension (same repository) the rotation is applied to the item's source: no files, no take FX, no latency, the waveform display updates at once and the project file stays a plain project. Without the extension the bundled JSFX "Phase Rotation (RX-style, Hilbert)" is used as a take FX (plus a Render button).\par}
 {\pard \ql \f0 \sa180 \li0 \fi0 Select one or more audio items and run the action. Keys: S = Suggest, Space = Preview, B = Bypass, Esc = close.\par}
 }
 ]]></description>
         <link rel="website">https://github.com/dennech/reaper-phase-rotation</link>
       </metadata>
-      <version name="1.1.0" author="dennech" time="2026-09-14T19:30:00Z">
-        <changelog><![CDATA[Suggest now reproduces iZotope RX 10's values (L8 criterion, RX sign convention). New engine: with the reaper_phaserot extension the rotation is applied to the item's source (no files, no take FX, waveform updates immediately, plain project file). Adaptive mode with look-ahead interpolation matches RX's adaptive peaks. Take-FX engine kept as fallback.]]></changelog>
+      <version name="1.1.1" author="dennech" time="2026-09-14T20:30:00Z">
+        <changelog><![CDATA[1.1.1: analysis in source mode uses the item's window, play rate and channel mode; Link honoured by the extension's adaptive mode; JSFX adaptive interpolation matches the extension; legacy take FX removed when the source engine takes over; fixes from an independent code review.
+1.1.0: Suggest reproduces iZotope RX 10's values (L8 criterion, RX sign convention). New engine: with the reaper_phaserot extension the rotation is applied to the item's source (no files, no take FX, waveform updates immediately, plain project file). Adaptive mode with look-ahead interpolation matches RX's adaptive peaks. Take-FX engine kept as fallback.]]></changelog>
         <source main="main">https://github.com/dennech/reaper-phase-rotation/raw/main/Items/Phase%20Rotation%20(RX-style).lua</source>
         <source file="phase_rotation_core.lua">https://github.com/dennech/reaper-phase-rotation/raw/main/Items/phase_rotation_core.lua</source>
         <source file="phase_rotation.jsfx" type="effect">https://github.com/dennech/reaper-phase-rotation/raw/main/Items/phase_rotation.jsfx</source>
@@ -29,13 +30,13 @@
 ]]></description>
         <link rel="website">https://github.com/dennech/reaper-phase-rotation</link>
       </metadata>
-      <version name="1.0.0" author="dennech" time="2026-09-14T19:30:00Z">
-        <changelog><![CDATA[Initial release.]]></changelog>
-        <source platform="darwin-arm64" file="reaper_phaserot.dylib">https://github.com/dennech/reaper-phase-rotation/releases/download/v1.1.0/reaper_phaserot-darwin-universal.dylib</source>
-        <source platform="darwin-x64" file="reaper_phaserot.dylib">https://github.com/dennech/reaper-phase-rotation/releases/download/v1.1.0/reaper_phaserot-darwin-universal.dylib</source>
-        <source platform="win64" file="reaper_phaserot.dll">https://github.com/dennech/reaper-phase-rotation/releases/download/v1.1.0/reaper_phaserot-win64.dll</source>
-        <source platform="linux-x86_64" file="reaper_phaserot.so">https://github.com/dennech/reaper-phase-rotation/releases/download/v1.1.0/reaper_phaserot-linux-x86_64.so</source>
-        <source platform="linux-aarch64" file="reaper_phaserot.so">https://github.com/dennech/reaper-phase-rotation/releases/download/v1.1.0/reaper_phaserot-linux-aarch64.so</source>
+      <version name="1.0.1" author="dennech" time="2026-09-14T20:30:00Z">
+        <changelog><![CDATA[1.0.1: deferred deletion of replaced source wrappers (audio-thread safety), separate decoder for UI reads, no allocations in the audio path, Link for adaptive mode, take-window/channel-mode aware analysis, sources restored on unload.]]></changelog>
+        <source platform="darwin-arm64" file="reaper_phaserot.dylib">https://github.com/dennech/reaper-phase-rotation/releases/download/v1.1.1/reaper_phaserot-darwin-universal.dylib</source>
+        <source platform="darwin-x64" file="reaper_phaserot.dylib">https://github.com/dennech/reaper-phase-rotation/releases/download/v1.1.1/reaper_phaserot-darwin-universal.dylib</source>
+        <source platform="win64" file="reaper_phaserot.dll">https://github.com/dennech/reaper-phase-rotation/releases/download/v1.1.1/reaper_phaserot-win64.dll</source>
+        <source platform="linux-x86_64" file="reaper_phaserot.so">https://github.com/dennech/reaper-phase-rotation/releases/download/v1.1.1/reaper_phaserot-linux-x86_64.so</source>
+        <source platform="linux-aarch64" file="reaper_phaserot.so">https://github.com/dennech/reaper-phase-rotation/releases/download/v1.1.1/reaper_phaserot-linux-aarch64.so</source>
       </version>
     </reapack>
   </category>

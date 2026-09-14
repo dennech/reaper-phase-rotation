@@ -8,7 +8,7 @@ It is the engine behind the *Phase Rotation (RX-style)* script; it has no UI of 
   for playback, rendering, glue **and waveform peaks**. No latency, no files.
 * The wrapper reports the child's type and writes the child's state, so a saved project
   contains a normal `<SOURCE WAVE …>`. The rotation lives in the take's `P_EXT:phaserot`
-  string (`1 angle_l angle_r adaptive smooth bypass`), which REAPER keeps in the project
+  string (`1 angle_l angle_r adaptive smooth bypass link`), which REAPER keeps in the project
   and in undo states. A timer keeps sources in sync with `P_EXT` (project load, undo/redo,
   copy/paste, other scripts). Without the extension the original file plays unprocessed.
 * Adaptive mode: the angle minimising the peak is estimated per 43 ms sub-block and
@@ -18,9 +18,9 @@ It is the engine behind the *Phase Rotation (RX-style)* script; it has no UI of 
 
 | Function | Description |
 |---|---|
-| `boolean PhaseRot_SetTake(take, angle_l, angle_r, adaptive, smooth, bypass)` | apply / update (degrees, RX sign convention) |
+| `boolean PhaseRot_SetTake(take, angle_l, angle_r, adaptive, smooth, bypass, link)` | apply / update (degrees, RX sign convention; link=1: adaptive tracks one angle for both channels) |
 | `boolean PhaseRot_ClearTake(take)` | remove, restore the original source |
-| `boolean, al, ar, adaptive, smooth, bypass = PhaseRot_GetTake(take, 0,0,0,0,0)` | read the settings |
+| `boolean, al, ar, adaptive, smooth, bypass, link = PhaseRot_GetTake(take, 0,0,0,0,0,0)` | read the settings |
 | `boolean PhaseRot_Analyze(take)` | analyse the original audio; result in `GetExtState("phaserot","analysis")` |
 | `PhaseRot_Refresh()` | re-sync all takes now |
 | `string PhaseRot_GetVersion()` | version |
