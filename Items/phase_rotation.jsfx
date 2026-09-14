@@ -1,0 +1,267 @@
+desc:Phase Rotation (RX-style, Hilbert)
+// Broadband phase rotation by an arbitrary angle, per channel, with an
+// optional adaptive (time-varying) mode that keeps the waveform symmetric
+// by minimising the peak level -- the same idea as the "Phase" module of
+// iZotope RX. Angle sign convention is the same as RX (verified against
+// RX 10 renders).
+//
+// DSP: linear-phase FIR Hilbert transformer (Kaiser window, 8193 taps at
+// <=50 kHz, 16385 taps above) applied by FFT overlap-save convolution.
+// At 0 degrees the output is bit-identical to the input (after PDC).
+//
+//   y = cos(theta) * x + sin(theta) * H{x}
+//
+// Adaptive mode estimates, every ~43 ms, the angle minimising the peak of the
+// block and glides to it (per block, the plain peak criterion gives lower peaks
+// than the L8 criterion that the Lua "Suggest" uses to match RX's numbers).
+//
+// Part of "REAPER Phase Rotation": https://github.com/dennech/reaper-phase-rotation
+// The Lua script "Phase Rotation (RX-style).lua" drives this effect
+// (Suggest / Preview / Render). It can also be used stand-alone.
+//
+// License: MIT. Author: dennech (built together with Claude).
+//tags: processing phase utility voice
+//author: dennech
+// @noindex
+
+slider1:angle_l=0<-180,180,0.1>Left rotation (deg)
+slider2:angle_r=0<-180,180,0.1>Right rotation (deg)
+slider3:link=1<0,1,1{Off,On}>Link L/R
+slider4:adaptive=0<0,1,1{Off,On}>Adaptive phase rotation
+slider5:adapt_ms=250<20,2000,10>Adaptive response (ms)
+slider6:cur_l_deg=0<-180,180,0.01>-Current L rotation (read-only)
+slider7:cur_r_deg=0<-180,180,0.01>-Current R rotation (read-only)
+
+in_pin:left input
+in_pin:right input
+out_pin:left output
+out_pin:right output
+
+@init
+// NOTE: EEL2 identifiers are case-insensitive, so globals use distinct names
+// (NFFT/MFIR/DFIR) that cannot collide with the short lowercase locals.
+// ---------------------------------------------------------------- constants
+BETA = 8;                 // Kaiser beta
+NB = 90;                  // adaptive: phase bins over [0,180) -> 2 degrees each
+GATE2 = 0.000001;         // adaptive: hold below -60 dBFS envelope (no exponent literals: EEL2 does not parse them)
+RELGATE2 = 0.01;          // adaptive: hold below -20 dB of the recent peak
+THR2 = 0.25;              // adaptive: only samples with envelope >= 0.5 * block max can set the peak
+TIE = 1.002;              // adaptive: peaks within 0.2% (0.017 dB) count as equal (hysteresis picks the nearest)
+
+// ---------------------------------------------------------------- memory map
+FFTBUF = 0;               // 2*NFFT values  (must not cross a 65536 boundary)
+HSPEC  = 65536;           // 2*NFFT values  spectrum of the FIR (scaled by 1/NFFT)
+INBUF  = 131072;          // 2*NFFT values  complex input: re=L, im=R
+OUTBUF = 196608;          // 2*HOP values
+ABSCOS = 262144;          // 360 values |cos(i deg)|
+COST   = 262144 + 512;    // 180 values
+BINS_L = 262144 + 1024;   // NB values
+BINS_R = 262144 + 1280;   // NB values
+
+function bessel_i0(x) local(s, t, k, q) (
+  q = x * x * 0.25; s = 1; t = 1; k = 1;
+  loop(80, t *= q / (k * k); s += t; k += 1;);
+  s;
+);
+
+function setup() local(k, w, i0b, i) (
+  NFFT = srate > 50000 ? 32768 : 16384;   // FFT size (complex points)
+  MFIR = NFFT / 2 + 1;                       // FIR length (odd)
+  DFIR = (MFIR - 1) / 2;                     // FIR group delay
+  HOP = NFFT / 2;                         // new samples per block (= NFFT - MFIR + 1)
+  SUB = HOP / 4;                       // adaptive analysis sub-block (~43 ms)
+  NSUB = 4;
+
+  // Kaiser-windowed ideal Hilbert transformer, pre-scaled by 1/NFFT (unnormalised ifft)
+  i0b = bessel_i0(BETA);
+  memset(FFTBUF, 0, 2 * NFFT);
+  k = -DFIR;
+  loop(MFIR,
+    (abs(k) % 2) == 1 ? (
+      w = bessel_i0(BETA * sqrt(max(0, 1 - (k / DFIR) * (k / DFIR)))) / i0b;
+      FFTBUF[2 * (k + DFIR)] = 2 / ($pi * k) * w / NFFT;
+    );
+    k += 1;
+  );
+  fft(FFTBUF, NFFT);
+  memcpy(HSPEC, FFTBUF, 2 * NFFT);
+
+  memset(INBUF, 0, 2 * NFFT);
+  memset(OUTBUF, 0, 2 * HOP);
+  pos = 0;
+
+  i = 0;
+  loop(360, ABSCOS[i] = abs(cos(i * $pi / 180)); i += 1;);
+
+  pdc_delay = HOP + DFIR;
+  pdc_bot_ch = 0; pdc_top_ch = 2;
+  runpk2_l = 0; runpk2_r = 0;
+  coef_manual = 1 - exp(-1 / (0.010 * srate));
+);
+
+
+// Find the angle (degrees, continuous, closest to cur_deg) minimising the block
+// peak max_b bins[b] * |cos(phi_b - theta)|.  Bins hold the max envelope per
+// 2-degree phase bin (phase folded to [0,180) because |cos| has period 180).
+function search(bins, cur_deg) local(t, b, c, v, idx, best, bestt, d, bestd, rep) (
+  best = -1; bestt = 0;
+  t = 0;
+  loop(180,
+    c = 0; b = 0;
+    loop(NB,
+      bins[b] > 0 ? (
+        idx = 2 * b + 1 - t; idx < 0 ? ( idx += 360 );
+        v = bins[b] * ABSCOS[idx]; v > c ? ( c = v );
+      );
+      b += 1;
+    );
+    COST[t] = c;
+    (best < 0 || c < best) ? ( best = c; bestt = t; );
+    t += 1;
+  );
+  // among near-ties prefer the candidate closest to the current angle (hysteresis)
+  bestd = 1000000000; t = 0;
+  loop(180,
+    COST[t] <= best * TIE ? (
+      d = abs(t - cur_deg); d = d - 180 * floor(d / 180 + 0.5); d = abs(d);
+      d < bestd ? ( bestd = d; bestt = t; );
+    );
+    t += 1;
+  );
+  // representative of bestt (mod 180) nearest to cur_deg
+  rep = bestt + 180 * floor((cur_deg - bestt) / 180 + 0.5);
+  rep;
+);
+
+// Estimate target angles from sub-block starting at block-relative offset 'off'.
+function estimate(off) local(n, j, xl, xr, hl, hr, a2, mx2l, mx2r, thr2l, thr2r, ph, b, amp, hold_l, hold_r, el, er, dec) (
+  mx2l = 0; mx2r = 0; n = 0;
+  loop(SUB,
+    j = MFIR - 1 + off + n;
+    xl = INBUF[2 * (j - DFIR)]; hl = FFTBUF[2 * j]; a2 = xl * xl + hl * hl; a2 > mx2l ? ( mx2l = a2 );
+    xr = INBUF[2 * (j - DFIR) + 1]; hr = FFTBUF[2 * j + 1]; a2 = xr * xr + hr * hr; a2 > mx2r ? ( mx2r = a2 );
+    n += 1;
+  );
+  dec = 0.97;   // about -6 dB/s decay of the recent-peak tracker (per 43 ms sub-block)
+  runpk2_l = max(mx2l, runpk2_l * dec); runpk2_r = max(mx2r, runpk2_r * dec);
+  hold_l = mx2l < GATE2 || mx2l < runpk2_l * RELGATE2;
+  hold_r = mx2r < GATE2 || mx2r < runpk2_r * RELGATE2;
+  link ? ( hold_l = hold_l && hold_r; hold_r = hold_l; );
+
+  (!hold_l || !hold_r) ? (
+    memset(BINS_L, 0, NB); memset(BINS_R, 0, NB);
+    thr2l = mx2l * THR2; thr2r = mx2r * THR2;
+    n = 0;
+    loop(SUB,
+      j = MFIR - 1 + off + n;
+      xl = INBUF[2 * (j - DFIR)]; hl = FFTBUF[2 * j]; a2 = xl * xl + hl * hl;
+      a2 >= thr2l && a2 > 0 ? (
+        ph = atan2(hl, xl); ph < 0 ? ( ph += $pi );
+        b = floor(ph * NB / $pi); b >= NB ? ( b = NB - 1 );
+        amp = sqrt(a2); amp > BINS_L[b] ? ( BINS_L[b] = amp );
+      );
+      xr = INBUF[2 * (j - DFIR) + 1]; hr = FFTBUF[2 * j + 1]; a2 = xr * xr + hr * hr;
+      a2 >= thr2r && a2 > 0 ? (
+        ph = atan2(hr, xr); ph < 0 ? ( ph += $pi );
+        b = floor(ph * NB / $pi); b >= NB ? ( b = NB - 1 );
+        amp = sqrt(a2); amp > BINS_R[b] ? ( BINS_R[b] = amp );
+      );
+      n += 1;
+    );
+    link ? (
+      b = 0; loop(NB, BINS_L[b] = max(BINS_L[b], BINS_R[b]); b += 1;);
+      el = search(BINS_L, cur_l * 180 / $pi);
+      tgt_l = el * $pi / 180; tgt_r = tgt_l;
+    ) : (
+      !hold_l ? ( tgt_l = search(BINS_L, cur_l * 180 / $pi) * $pi / 180 );
+      !hold_r ? ( tgt_r = search(BINS_R, cur_r * 180 / $pi) * $pi / 180 );
+    );
+  );
+);
+
+function process_block() local(k, n, j, xl, xr, hl, hr, cl, sl, cr, sr_, coef, o) (
+  memcpy(FFTBUF, INBUF, 2 * NFFT);
+  fft(FFTBUF, NFFT);
+  convolve_c(FFTBUF, HSPEC, NFFT);
+  ifft(FFTBUF, NFFT);
+  // FFTBUF[2j], FFTBUF[2j+1] = H{L}, H{R} at index j (valid for j >= MFIR-1),
+  // aligned with the dry sample INBUF[2(j-DFIR)] (FIR delay DFIR).
+
+  adaptive ? (
+    coef = 1 - exp(-1 / (max(adapt_ms, 1) * 0.001 * srate));
+  ) : (
+    // read the sliders here (no dependency on the slider section having run)
+    coef = coef_manual;
+    tgt_l = angle_l * $pi / 180;
+    tgt_r = angle_r * $pi / 180;
+  );
+
+  k = 0;
+  loop(NSUB,
+    adaptive ? ( estimate(k * SUB) );
+    n = 0;
+    loop(SUB,
+      j = MFIR - 1 + k * SUB + n;
+      xl = INBUF[2 * (j - DFIR)]; xr = INBUF[2 * (j - DFIR) + 1];
+      hl = FFTBUF[2 * j];      hr = FFTBUF[2 * j + 1];
+      cur_l += (tgt_l - cur_l) * coef; cur_r += (tgt_r - cur_r) * coef;
+      cl = cos(cur_l); sl = sin(cur_l); cr = cos(cur_r); sr_ = sin(cur_r);
+      o = 2 * (k * SUB + n);
+      OUTBUF[o]     = cl * xl + sl * hl;
+      OUTBUF[o + 1] = cr * xr + sr_ * hr;
+      n += 1;
+    );
+    k += 1;
+  );
+  memcpy(INBUF, INBUF + 2 * HOP, 2 * (MFIR - 1));
+
+  // keep the continuous angle bounded (cos/sin are unchanged by +-360)
+  cur_l > 2 * $pi ? ( cur_l -= 2 * $pi; tgt_l -= 2 * $pi; ) : ( cur_l < -2 * $pi ? ( cur_l += 2 * $pi; tgt_l += 2 * $pi; ) );
+  cur_r > 2 * $pi ? ( cur_r -= 2 * $pi; tgt_r -= 2 * $pi; ) : ( cur_r < -2 * $pi ? ( cur_r += 2 * $pi; tgt_r += 2 * $pi; ) );
+  // wrap to (-180, 180] for display
+  cur_l_deg = cur_l * 180 / $pi; cur_l_deg = cur_l_deg - 360 * floor((cur_l_deg + 180) / 360);
+  cur_r_deg = cur_r * 180 / $pi; cur_r_deg = cur_r_deg - 360 * floor((cur_r_deg + 180) / 360);
+);
+
+// ---- top-level @init code (must come after ALL function definitions: EEL2
+// functions defined below the first top-level statement are not visible to
+// other sections) ------------------------------------------------------------
+setup();
+man_l = angle_l * $pi / 180;
+man_r = angle_r * $pi / 180;
+cur_l = man_l; cur_r = man_r;
+tgt_l = man_l; tgt_r = man_r;
+prev_l = angle_l; prev_r = angle_r;
+
+@slider
+link ? (
+  angle_l != prev_l ? ( angle_r = angle_l; ) : ( angle_r != prev_r ? ( angle_l = angle_r; ) );
+);
+prev_l = angle_l; prev_r = angle_r;
+man_l = angle_l * $pi / 180;
+man_r = angle_r * $pi / 180;
+!adaptive ? ( tgt_l = man_l; tgt_r = man_r; );
+
+@sample
+INBUF[2 * (MFIR - 1 + pos)]     = spl0;
+INBUF[2 * (MFIR - 1 + pos) + 1] = spl1;
+spl0 = OUTBUF[2 * pos];
+spl1 = OUTBUF[2 * pos + 1];
+pos += 1;
+pos >= HOP ? ( process_block(); pos = 0; );
+
+@gfx 360 90
+gfx_r = 0.16; gfx_g = 0.17; gfx_b = 0.19; gfx_a = 1;
+gfx_rect(0, 0, gfx_w, gfx_h);
+gfx_setfont(1, "Arial", 14);
+gfx_r = 0.85; gfx_g = 0.85; gfx_b = 0.85;
+gfx_x = 10; gfx_y = 10;
+adaptive ? (
+  gfx_printf("Adaptive phase rotation: ON (%d ms)", adapt_ms);
+  gfx_x = 10; gfx_y = 32; gfx_printf("Current rotation  L %+.1f deg   R %+.1f deg", cur_l_deg, cur_r_deg);
+) : (
+  link ? gfx_printf("Fixed rotation  L %+.1f deg   R %+.1f deg  (linked)", angle_l, angle_r)
+       : gfx_printf("Fixed rotation  L %+.1f deg   R %+.1f deg", angle_l, angle_r);
+);
+gfx_x = 10; gfx_y = 54; gfx_r = 0.55; gfx_g = 0.55; gfx_b = 0.55;
+gfx_printf("Hilbert FIR %d taps, latency %d smp (%.0f ms), compensated", MFIR, pdc_delay, pdc_delay * 1000 / srate);

@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<index version="1" name="REAPER Phase Rotation">
+  <category name="Items">
+    <reapack name="Phase Rotation (RX-style).lua" type="script" desc="Phase Rotation (RX-style): suggest, preview and render broadband phase rotation for selected items">
+      <metadata>
+        <description><![CDATA[{\rtf1\ansi\deff0{\fonttbl{\f0 \fswiss Helvetica;}}
+{\pard \ql \f0 \sa180 \li0 \fi0 {\b Phase Rotation (RX-style)} - a REAPER re-creation of the iZotope RX "Phase" module for media items.\par}
+{\pard \ql \f0 \sa180 \li0 \fi0 Suggest finds the channel-linked fixed rotation that minimises the peak level of the selected items; Left/Right rotation sliders with Link; Adaptive phase rotation; Preview / Bypass; Render bakes the rotation into a new take. Processing is done by the bundled JSFX "Phase Rotation (RX-style, Hilbert)" (linear-phase FIR Hilbert transformer, 0 degrees = bit-transparent), inserted as a take FX so everything stays non-destructive until you press Render.\par}
+{\pard \ql \f0 \sa180 \li0 \fi0 Select one or more audio items and run the action. Keys: S = Suggest, Space = Preview, B = Bypass, Esc = close.\par}
+}
+]]></description>
+        <link rel="website">https://github.com/dennech/reaper-phase-rotation</link>
+      </metadata>
+      <version name="1.0.0" author="dennech" time="2026-09-14T14:00:00Z">
+        <changelog><![CDATA[Initial release: Suggest (peak-minimising channel-linked angle), L/R sliders with Link, Adaptive phase rotation, Preview/Bypass/Render, polar envelope-vs-phase display.]]></changelog>
+        <source main="main">https://github.com/dennech/reaper-phase-rotation/raw/main/Items/Phase%20Rotation%20(RX-style).lua</source>
+        <source file="phase_rotation_core.lua">https://github.com/dennech/reaper-phase-rotation/raw/main/Items/phase_rotation_core.lua</source>
+        <source file="phase_rotation.jsfx" type="effect">https://github.com/dennech/reaper-phase-rotation/raw/main/Items/phase_rotation.jsfx</source>
+      </version>
+    </reapack>
+  </category>
+</index>
