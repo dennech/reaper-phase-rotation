@@ -529,7 +529,7 @@ public:
     int nvalid_in = fetch_child(src, t_in - (double)PRE / srate, srate, nch, PRE + nin, in.data()) - PRE;
     if (nvalid_in <= 0 && time_s >= GetLength()) return;
     if (ap) stream->run(in.data(), PRE + nin, nch, pos - PRE, PRE + length);
-    const double* IN = in.data() + (size_t)PRE * nch;
+    const double* inp = in.data() + (size_t)PRE * nch;
 
     const double a_l = p.angle_l * PI / 180, a_r = p.angle_r * PI / 180;
     const double cl = std::cos(a_l), sl = std::sin(a_l), cr = std::cos(a_r), sr_ = std::sin(a_r);
@@ -540,8 +540,8 @@ public:
       if (!rot_c0 && !rot_c1) {
         // channels beyond the first two pass through untouched
         for (int f = 0; f < length; f++) {
-          out[(size_t)f * nch + c0] = IN[(size_t)(f + D) * nch + c0];
-          if (c1 >= 0) out[(size_t)f * nch + c1] = IN[(size_t)(f + D) * nch + c1];
+          out[(size_t)f * nch + c0] = inp[(size_t)(f + D) * nch + c0];
+          if (c1 >= 0) out[(size_t)f * nch + c1] = inp[(size_t)(f + D) * nch + c1];
         }
         continue;
       }
@@ -549,7 +549,7 @@ public:
         // block input frames [start, start + N) of 'in' (zero beyond nin)
         for (int j = 0; j < N; j++) {
           int f = start + j;
-          if (f < nin) { fbuf[j].re = IN[(size_t)f * nch + c0]; fbuf[j].im = c1 >= 0 ? IN[(size_t)f * nch + c1] : 0.0; }
+          if (f < nin) { fbuf[j].re = inp[(size_t)f * nch + c0]; fbuf[j].im = c1 >= 0 ? inp[(size_t)f * nch + c1] : 0.0; }
           else { fbuf[j].re = 0; fbuf[j].im = 0; }
         }
         dsp::hilbert_block(*kern, fbuf.data());
@@ -557,8 +557,8 @@ public:
         for (int i = 0; i < nout; i++) {
           int f = start + i;                 // output frame
           int j = i + (M - 1);               // FFT index with valid linear convolution
-          double xl = IN[(size_t)(f + D) * nch + c0], hl = fbuf[j].re;
-          double xr = c1 >= 0 ? IN[(size_t)(f + D) * nch + c1] : 0.0, hr = fbuf[j].im;
+          double xl = inp[(size_t)(f + D) * nch + c0], hl = fbuf[j].re;
+          double xr = c1 >= 0 ? inp[(size_t)(f + D) * nch + c1] : 0.0, hr = fbuf[j].im;
           double cL = cl, sL = sl, cR = cr, sR = sr_;
           if (p.adaptive && traj) {
             double t = time_s + (double)f / srate;
@@ -700,15 +700,15 @@ private:
       in.assign((size_t)(PRE + nin) * nch, 0.0);
       fetch_child(src, t - (double)PRE / sr, sr, nch, PRE + nin, in.data());
       if (ap) stream.run(in.data(), PRE + nin, nch, pos - PRE, PRE + n);
-      const double* IN = in.data() + (size_t)PRE * nch;
+      const double* inp = in.data() + (size_t)PRE * nch;
       for (int j = 0; j < N; j++) {
-        if (j < nin) { fbuf[j].re = IN[(size_t)j * nch]; fbuf[j].im = nch > 1 ? IN[(size_t)j * nch + 1] : 0.0; }
+        if (j < nin) { fbuf[j].re = inp[(size_t)j * nch]; fbuf[j].im = nch > 1 ? inp[(size_t)j * nch + 1] : 0.0; }
         else fbuf[j].re = fbuf[j].im = 0;
       }
       dsp::hilbert_block(*kern, fbuf.data());
       for (int f = 0; f < n; f++) {
-        x[(size_t)f * 2] = IN[(size_t)(f + D) * nch]; h[(size_t)f * 2] = fbuf[f + M - 1].re;
-        x[(size_t)f * 2 + 1] = nch > 1 ? IN[(size_t)(f + D) * nch + 1] : 0.0; h[(size_t)f * 2 + 1] = fbuf[f + M - 1].im;
+        x[(size_t)f * 2] = inp[(size_t)(f + D) * nch]; h[(size_t)f * 2] = fbuf[f + M - 1].re;
+        x[(size_t)f * 2 + 1] = nch > 1 ? inp[(size_t)(f + D) * nch + 1] : 0.0; h[(size_t)f * 2 + 1] = fbuf[f + M - 1].im;
       }
       for (int s0 = 0; s0 < n; s0 += SUB) {
         int s1 = std::min(n, s0 + SUB);
@@ -1077,15 +1077,15 @@ static bool analyze_take(MediaItem_Take* take, const Params& ap_params)
     }
     for (int f = 0; f < n; f++) for (int c = 0; c < nch; c++) { double v = std::fabs(in[(size_t)(PRE + f + D) * nch + c]); if (v > orig_peak[c]) orig_peak[c] = v; }
     if (ap) stream.run(in.data(), ntot, nch, pos - PRE, PRE + n);
-    const double* IN = in.data() + (size_t)PRE * nch;
+    const double* inp = in.data() + (size_t)PRE * nch;
     for (int j = 0; j < N; j++) {
-      if (j < nin) { fbuf[j].re = IN[(size_t)j * nch]; fbuf[j].im = nch > 1 ? IN[(size_t)j * nch + 1] : 0.0; }
+      if (j < nin) { fbuf[j].re = inp[(size_t)j * nch]; fbuf[j].im = nch > 1 ? inp[(size_t)j * nch + 1] : 0.0; }
       else fbuf[j].re = fbuf[j].im = 0;
     }
     dsp::hilbert_block(*kern, fbuf.data());
     for (int f = 0; f < n; f++) {
       for (int c = 0; c < nch; c++) {
-        double x = IN[(size_t)(f + D) * nch + c];
+        double x = inp[(size_t)(f + D) * nch + c];
         double h = c == 0 ? fbuf[f + M - 1].re : fbuf[f + M - 1].im;
         ana::ChanStats& st = cs[c];
         if (x > st.pos) st.pos = x; else if (-x > st.neg) st.neg = -x;
