@@ -13,11 +13,46 @@
 local r = reaper
 local core = {}
 
-core.VERSION = "1.1.2"
+core.VERSION = "1.2.0"
 core.SECTION = "dennech_PhaseRotation"           -- ExtState section
 core.JSFX_FILE = "phase_rotation.jsfx"
 core.FX_DESC = "Phase Rotation (RX-style, Hilbert)"
-core.PARAM = { ANGLE_L = 0, ANGLE_R = 1, LINK = 2, ADAPTIVE = 3, ADAPT_SMOOTH = 4, CUR_L = 5, CUR_R = 6 }
+core.PARAM = { ANGLE_L = 0, ANGLE_R = 1, LINK = 2, ADAPTIVE = 3, ADAPT_SMOOTH = 4, CUR_L = 5, CUR_R = 6,
+               AP_TYPE = 7, AP_STAGES = 8, AP_FREQ = 9, AP_Q = 10 }
+
+-- Allpass rotator (broadcast-style phase rotator) presets. type 0 = off, 1 = cascade of
+-- first-order allpass sections, 2 = cascade of second-order (RBJ) sections with Q.
+core.AP_PRESETS = {
+  { id = "off",    name = "RX-style rotation only",                    type = 0, stages = 4, freq = 200, q = 0.35 },
+  { id = "ap2",    name = "Allpass 2 x 200 Hz",                        type = 1, stages = 2, freq = 200, q = 0.35 },
+  { id = "orban4", name = "Orban classic: 4 x 200 Hz",                 type = 1, stages = 4, freq = 200, q = 0.35 },
+  { id = "ap6",    name = "Allpass 6 x 200 Hz",                        type = 1, stages = 6, freq = 200, q = 0.35 },
+  { id = "vpr",    name = "VoicePhaseRotator: 8 x 2nd-order 200 Hz, Q 0.35", type = 2, stages = 8, freq = 200, q = 0.35 },
+}
+core.AP_OFF = { type = 0, stages = 4, freq = 200, q = 0.35 }
+
+function core.ap_copy(ap)
+  ap = ap or core.AP_OFF
+  return { type = ap.type or 0, stages = ap.stages or 4, freq = ap.freq or 200, q = ap.q or 0.35 }
+end
+function core.ap_on(ap) return ap ~= nil and (ap.type or 0) ~= 0 end
+function core.ap_equal(a, b)
+  a, b = core.ap_copy(a), core.ap_copy(b)
+  if a.type == 0 and b.type == 0 then return true end
+  return a.type == b.type and a.stages == b.stages and math.abs(a.freq - b.freq) < 1e-6 and (a.type == 1 or math.abs(a.q - b.q) < 1e-6)
+end
+function core.ap_preset_index(ap)
+  for i, p in ipairs(core.AP_PRESETS) do if core.ap_equal(p, ap) then return i end end
+  return nil
+end
+function core.ap_label(ap)
+  ap = core.ap_copy(ap)
+  if ap.type == 0 then return "RX-style" end
+  local i = core.ap_preset_index(ap)
+  if i then return core.AP_PRESETS[i].name end
+  if ap.type == 1 then return string.format("Allpass %d x %.0f Hz", ap.stages, ap.freq) end
+  return string.format("Allpass %d x 2nd-order %.0f Hz, Q %.2f", ap.stages, ap.freq, ap.q)
+end
 
 core.BETA = 8               -- Kaiser beta
 core.THR_REL = 0.1          -- samples with envelope < 0.1 * max are ignored (negligible for both criteria)
@@ -180,11 +215,12 @@ function core.get_state(take, fx)
     angle_l = g(P.ANGLE_L), angle_r = g(P.ANGLE_R),
     link = g(P.LINK) >= 0.5, adaptive = g(P.ADAPTIVE) >= 0.5,
     smooth = floor(g(P.ADAPT_SMOOTH) + 0.5), cur_l = g(P.CUR_L), cur_r = g(P.CUR_R),
+    ap = { type = floor(g(P.AP_TYPE) + 0.5), stages = floor(g(P.AP_STAGES) + 0.5), freq = g(P.AP_FREQ), q = g(P.AP_Q) },
     enabled = r.TakeFX_GetEnabled(take, fx), mode = "fx",
   }
 end
 
--- st fields are optional: angle_l, angle_r, link, adaptive, smooth, enabled
+-- st fields are optional: angle_l, angle_r, link, adaptive, smooth, enabled, ap = {type, stages, freq, q}
 function core.set_state(take, fx, st)
   local P = core.PARAM
   if st.link ~= nil then r.TakeFX_SetParam(take, fx, P.LINK, st.link and 1 or 0) end
@@ -192,6 +228,13 @@ function core.set_state(take, fx, st)
   if st.smooth then r.TakeFX_SetParam(take, fx, P.ADAPT_SMOOTH, st.smooth) end
   if st.angle_l then r.TakeFX_SetParam(take, fx, P.ANGLE_L, st.angle_l) end
   if st.angle_r then r.TakeFX_SetParam(take, fx, P.ANGLE_R, st.angle_r) end
+  if st.ap then
+    local ap = core.ap_copy(st.ap)
+    r.TakeFX_SetParam(take, fx, P.AP_TYPE, ap.type)
+    r.TakeFX_SetParam(take, fx, P.AP_STAGES, ap.stages)
+    r.TakeFX_SetParam(take, fx, P.AP_FREQ, ap.freq)
+    r.TakeFX_SetParam(take, fx, P.AP_Q, ap.q)
+  end
   if st.enabled ~= nil then r.TakeFX_SetEnabled(take, fx, st.enabled) end
 end
 
@@ -381,12 +424,48 @@ function core.shape(bins)
   return s
 end
 
+-- Allpass rotator applied in place to an interleaved 2-channel table (used by the Lua analysis
+-- when the extension is not present). state = { {..}, {..} } per channel, 2 values per stage.
+local function ap_coefs(ap, sr)
+  ap = core.ap_copy(ap)
+  local f = max(1, min(ap.freq, sr * 0.45))
+  if ap.type == 2 then
+    local w0 = 2 * PI * f / sr
+    local alpha = sin(w0) / (2 * max(ap.q, 0.05))
+    local a0 = 1 + alpha
+    local b0, b1 = (1 - alpha) / a0, -2 * cos(w0) / a0
+    return { type = 2, stages = ap.stages, b0 = b0, b1 = b1, b2 = 1, a1 = b1, a2 = b0 }
+  end
+  local k = math.tan(PI * f / sr)
+  return { type = 1, stages = ap.stages, c = (k - 1) / (k + 1) }
+end
+local function ap_run_table(t, n2, co, state)
+  for c = 0, 1 do
+    local zs = state[c + 1]
+    for s = 1, co.stages do
+      local z = zs[s]
+      if not z then z = { 0, 0 }; zs[s] = z end
+      local s1, s2 = z[1], z[2]
+      if co.type == 1 then
+        local cc = co.c
+        for i = 1 + c, n2, 2 do local x = t[i]; local y = cc * x + s1; s1 = x - cc * y; t[i] = y end
+      else
+        local b0, b1, b2, a1, a2 = co.b0, co.b1, co.b2, co.a1, co.a2
+        for i = 1 + c, n2, 2 do local x = t[i]; local y = b0 * x + s1; s1 = b1 * x - a1 * y + s2; s2 = b2 * x - a2 * y; t[i] = y end
+      end
+      z[1], z[2] = s1, s2
+    end
+  end
+end
+
 -- Analyse a take. Returns a result table (see bottom) or nil, err.
 -- opts.criterion = "rx" (default, RX-compatible L8) or "peak" (exact minimum sample peak).
+-- opts.ap = allpass rotator applied before the analysis (the suggested angle is for after it).
 -- progress(frac) is optional and is called once per block.
 function core.analyze(take, opts, progress)
   opts = opts or {}
   local criterion = opts.criterion == "peak" and "peak" or "rx"
+  local ap_on = core.ap_on(opts.ap)
   local t_start = r.time_precise()
   local item = r.GetMediaItemTake_Item(take)
   local src = r.GetMediaItemTake_Source(take)
@@ -419,13 +498,30 @@ function core.analyze(take, opts, progress)
   for b = 1, HALF do s81[b] = 0; s82[b] = 0 end
   local max2_1, max2_2, thr2_1, thr2_2 = 0, 0, 0, 0
   local pp1, np1, pp2, np2 = 0, 0, 0, 0
+  local peak_orig = 0
   local stereo = nch >= 2
 
   local read = 0
   local nblocks = (total + HOP - 1) // HOP
+  local apco, apstate = nil, nil
+  if ap_on then
+    apco, apstate = ap_coefs(opts.ap, sr), { {}, {} }
+    -- warm the IIR up on the 0.5 s before the item start (the accessor returns silence there)
+    local pre = floor(0.5 * sr)
+    local pt = r.new_array(2 * pre); pt.clear()
+    r.GetAudioAccessorSamples(acc, sr, 2, t0 - pre / sr, pre, pt)
+    local ptab = pt.table(); ap_run_table(ptab, 2 * pre, apco, apstate)
+  end
   for blk = 1, nblocks do
     tmp.clear()
     r.GetAudioAccessorSamples(acc, sr, 2, t0 + read / sr, HOP, tmp)
+    if ap_on then
+      local tt = tmp.table()
+      local nv2 = 2 * min(HOP, total - read)
+      for i = 1, nv2 do local a = tt[i]; if a < 0 then a = -a end; if a > peak_orig then peak_orig = a end end
+      ap_run_table(tt, 2 * HOP, apco, apstate)
+      tmp.copy(tt)
+    end
     inbuf.copy(tmp, 1, 2 * HOP, 2 * (M - 1) + 1)
     fftbuf.copy(inbuf, 1, 2 * N, 1)
     fftbuf.fft(N, true)
@@ -473,7 +569,7 @@ function core.analyze(take, opts, progress)
 
   -- results
   local res = { nch = nch, sr = sr, nsamples = total, duration = total / sr, channels = {},
-                bins = { bins1, bins2 }, criterion = criterion }
+                bins = { bins1, bins2 }, criterion = criterion, ap = core.ap_copy(opts.ap) }
   local NC = core.NCAND
   local costs, lps = {}, {}
   local function choose(costmax, cost8)
@@ -516,6 +612,7 @@ function core.analyze(take, opts, progress)
                    angle_rx = ch.angle_rx, angle_peak = ch.angle_peak, min_peak = ch.min_peak }
     res.peak_before = ch.peak_before
   end
+  res.peak_orig = ap_on and peak_orig or res.peak_before
   res.seconds = r.time_precise() - t_start
   return res
 end
@@ -581,26 +678,55 @@ function core.mode()
   return core.has_ext() and "source" or "fx"
 end
 
-function core.ext_get(take)
-  local ok, al, ar, ad, sm, by, li = r.PhaseRot_GetTake(take, 0, 0, 0, 0, 0, 0)
-  if not ok then return nil end
-  return { angle_l = al, angle_r = ar, adaptive = ad ~= 0, smooth = sm, enabled = by == 0, link = li ~= 0, mode = "source" }
+function core.has_preview_api()
+  return r.APIExists ~= nil and r.APIExists("PhaseRot_SetPreview") and r.APIExists("PhaseRot_AnalyzeEx")
 end
 
--- st fields optional (merged with the current state): angle_l, angle_r, adaptive, smooth, enabled
+function core.ext_get(take)
+  local ok, al, ar, ad, sm, by, li, at, ast, af, aq = r.PhaseRot_GetTake(take, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+  if not ok then return nil end
+  return { angle_l = al, angle_r = ar, adaptive = ad ~= 0, smooth = sm, enabled = by == 0, link = li ~= 0,
+           ap = { type = at or 0, stages = ast or 4, freq = af or 200, q = aq or 0.35 }, mode = "source" }
+end
+
+local function merged_state(take, st)
+  local cur = core.ext_get(take) or { angle_l = 0, angle_r = 0, adaptive = false, smooth = 0, enabled = true, link = true, ap = core.AP_OFF }
+  local m = {}
+  m.angle_l = st.angle_l or cur.angle_l
+  m.angle_r = st.angle_r or cur.angle_r
+  m.adaptive = st.adaptive; if m.adaptive == nil then m.adaptive = cur.adaptive end
+  m.smooth = st.smooth or cur.smooth or 0
+  m.enabled = st.enabled; if m.enabled == nil then m.enabled = cur.enabled end
+  m.link = st.link; if m.link == nil then m.link = cur.link end
+  m.ap = core.ap_copy(st.ap or cur.ap)
+  return m
+end
+
+-- st fields optional (merged with the current state): angle_l, angle_r, adaptive, smooth, enabled, link, ap
 function core.ext_set(take, st)
-  local cur = core.ext_get(take) or { angle_l = 0, angle_r = 0, adaptive = false, smooth = 0, enabled = true, link = true }
-  local al = st.angle_l or cur.angle_l
-  local ar = st.angle_r or cur.angle_r
-  local ad = st.adaptive; if ad == nil then ad = cur.adaptive end
-  local sm = st.smooth or cur.smooth or 0
-  local en = st.enabled; if en == nil then en = cur.enabled end
-  local li = st.link; if li == nil then li = cur.link end
-  return r.PhaseRot_SetTake(take, al, ar, ad and 1 or 0, sm, en and 0 or 1, li and 1 or 0)
+  local m = merged_state(take, st)
+  return r.PhaseRot_SetTake(take, m.angle_l, m.angle_r, m.adaptive and 1 or 0, m.smooth, m.enabled and 0 or 1, m.link and 1 or 0,
+                            m.ap.type, m.ap.stages, m.ap.freq, m.ap.q)
 end
 
 function core.ext_clear(take)
   return r.PhaseRot_ClearTake(take)
+end
+
+-- Audition: playback uses st, project/undo/waveform keep the applied state. st is a complete state
+-- (angle_l, angle_r, adaptive, smooth, link, ap); missing fields are taken from the applied state.
+function core.ext_preview(take, st)
+  if not core.has_preview_api() then return false end
+  local m = merged_state(take, st)
+  return r.PhaseRot_SetPreview(take, m.angle_l, m.angle_r, m.adaptive and 1 or 0, m.smooth, m.link and 1 or 0,
+                               m.ap.type, m.ap.stages, m.ap.freq, m.ap.q)
+end
+function core.ext_clear_preview(take)
+  if core.has_preview_api() then return r.PhaseRot_ClearPreview(take) end
+  return false
+end
+function core.ext_clear_all_previews()
+  if core.has_preview_api() then r.PhaseRot_ClearAllPreviews() end
 end
 
 -- max envelope per degree -> signed peaks after rotating by theta (degrees)
@@ -623,16 +749,24 @@ local function parse_kv(text)
   return t
 end
 
--- Analysis by the extension (on the ORIGINAL audio, even when the take is already rotated).
+-- Analysis by the extension (on the ORIGINAL audio, even when the take is already rotated),
+-- optionally through the allpass rotator opts.ap.
 function core.analyze_ext(take, opts)
   opts = opts or {}
   local criterion = opts.criterion == "peak" and "peak" or "rx"
   local t0 = r.time_precise()
-  if not r.PhaseRot_Analyze(take) then return nil, "analysis failed (not an audio take?)" end
+  local ok
+  if core.ap_on(opts.ap) and core.has_preview_api() then
+    local ap = core.ap_copy(opts.ap)
+    ok = r.PhaseRot_AnalyzeEx(take, ap.type, ap.stages, ap.freq, ap.q)
+  else
+    ok = r.PhaseRot_Analyze(take)
+  end
+  if not ok then return nil, "analysis failed (not an audio take?)" end
   local kv = parse_kv(r.GetExtState("phaserot", "analysis"))
   local nch = tonumber(kv.nch) or 1
   local res = { nch = nch, sr = tonumber(kv.sr) or 48000, duration = tonumber(kv.length) or 0, channels = {},
-                criterion = criterion, mode = "source", peak_before = tonumber(kv.peak_before) or 0 }
+                criterion = criterion, mode = "source", peak_before = tonumber(kv.peak_before) or 0, ap = core.ap_copy(opts.ap) }
   res.nsamples = floor(res.duration * res.sr + 0.5)
   for c = 0, nch - 1 do
     local shape = {}
@@ -659,12 +793,13 @@ function core.analyze_ext(take, opts)
   end
   res.linked = { angle = lang, peak_after = criterion == "peak" and (tonumber(kv.linked_minpeak) or 0) or (tonumber(kv.linked_after_rx) or 0),
                  pos_after = lpos, neg_after = lneg, angle_rx = l_rx, angle_peak = l_pk, min_peak = tonumber(kv.linked_minpeak) or 0 }
+  res.peak_orig = tonumber(kv.peak_orig) or res.peak_before
   res.seconds = r.time_precise() - t0
   return res
 end
 
 -- ------------------------------------------------------------ unified take API
--- state: { angle_l, angle_r, adaptive, smooth, enabled, mode } or nil when nothing is applied
+-- state: { angle_l, angle_r, adaptive, smooth, link, enabled, ap, mode } or nil when nothing is applied
 function core.get_take_state(take)
   if core.mode() == "source" then return core.ext_get(take) end
   local fx = core.find_fx(take)

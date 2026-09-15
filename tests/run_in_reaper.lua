@@ -104,6 +104,23 @@ local ok, err = xpcall(function()
     result("asym_mono.roundtrip_expected_peak_db", string.format("%.4f", db(res.channels[1].peak_after)))
   end
 
+  -- B2. allpass rotator (VoicePhaseRotator preset) + 20 deg through the JSFX; Lua analysis through the allpass
+  do
+    local item, take = insert(TD .. "/asym_mono.wav")
+    local res = assert(core.analyze(take, { ap = { type = 1, stages = 4, freq = 200, q = 0.35 } }))
+    result("asym_mono.ap4_angle0", string.format("%.4f", res.channels[1].best_angle))
+    log("lua analysis through allpass 4x200:", res.channels[1].best_angle, "peak_orig", res.peak_orig, "peak_before(after ap)", res.peak_before)
+    local fx = core.ensure_fx(take)
+    core.set_state(take, fx, { link = true, adaptive = false, angle_l = 20, angle_r = 20, ap = { type = 2, stages = 8, freq = 200, q = 0.35 } })
+    local s = core.get_state(take, fx)
+    log("jsfx ap state", s.ap.type, s.ap.stages, s.ap.freq, s.ap.q)
+    core.render({ item }, { keep_original = true })
+    result("asym_mono_ap.render", rendered_path(item))
+    result("asym_mono_ap.render_angles", "20")
+    result("asym_mono_ap.render_srcid", "asym_mono")
+    result("asym_mono_ap.render_ap", "2,8,200,0.35")
+  end
+
   -- C. adaptive render -------------------------------------------------------
   do
     local item = items.adaptive_switch

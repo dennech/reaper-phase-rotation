@@ -13,8 +13,13 @@
 // all takes and wraps / unwraps sources so that the state always follows P_EXT
 // (project load, undo/redo, copy/paste, scripts).
 //
+// Optional "allpass rotator" block (broadcast phase rotator: a cascade of identical
+// first- or second-order allpass sections, e.g. Orban's 4 x 200 Hz) runs BEFORE the
+// broadband rotation; analysis and the adaptive estimator see the allpass output.
+//
 // ReaScript API: PhaseRot_SetTake, PhaseRot_ClearTake, PhaseRot_GetTake,
-// PhaseRot_Analyze, PhaseRot_Refresh, PhaseRot_GetVersion.
+// PhaseRot_SetPreview / ClearPreview / ClearAllPreviews (audition without changing the
+// project or the waveform), PhaseRot_Analyze / AnalyzeEx, PhaseRot_Refresh, PhaseRot_GetVersion.
 //
 // Part of https://github.com/dennech/reaper-phase-rotation  (MIT)
 
@@ -61,7 +66,7 @@
 #include <algorithm>
 #include <atomic>
 
-#define PR_VERSION "1.0.2"
+#define PR_VERSION "1.1.0"
 #define PR_EXT_KEY "P_EXT:phaserot"
 #define PR_EXT_IDENTIFY 0x50524f54 /* 'PROT' */
 #define PR_MAGIC 0x50686153     /* 'PhaS' */
@@ -139,27 +144,120 @@ struct Trajectory {
   }
 };
 
+// ---- allpass "phase rotator": cascade of identical allpass sections (broadcast style)
+//   type 1: first-order, corner f0 (90 deg at f0):  y = c x + x[n-1] - c y[n-1],  c = (tan(pi f0/fs) - 1) / (tan(pi f0/fs) + 1)
+//   type 2: second-order (RBJ allpass) at f0 with Q: b = [1-a, -2cos w0, 1+a] / (1+a), a = sin w0 / 2Q
+// The same designs live in phase_rotation.jsfx and tests/reference.py.
+struct ApDesign {
+  int type = 0, stages = 0;
+  double c = 0, b0 = 1, b1 = 0, b2 = 0, a1 = 0, a2 = 0;
+  bool operator==(const ApDesign& o) const { return type == o.type && stages == o.stages && c == o.c && b0 == o.b0 && b1 == o.b1; }
+};
+
+static ApDesign ap_design(int type, int stages, double freq, double q, double srate)
+{
+  ApDesign d;
+  if (type <= 0 || stages <= 0 || srate < 1) return d;
+  d.type = type == 1 ? 1 : 2; d.stages = std::min(64, stages);
+  double f = std::max(1.0, std::min(freq, srate * 0.45));
+  if (d.type == 1) {
+    double k = std::tan(PI * f / srate);
+    d.c = (k - 1) / (k + 1);
+  } else {
+    double w0 = 2 * PI * f / srate, alpha = std::sin(w0) / (2 * std::max(q, 0.05)), a0 = 1 + alpha;
+    d.b0 = (1 - alpha) / a0; d.b1 = -2 * std::cos(w0) / a0; d.b2 = 1.0; d.a1 = d.b1; d.a2 = d.b0;
+  }
+  return d;
+}
+
+static int ap_preroll(double srate) { return (int)(0.5 * srate); }   // IIR warm-up before a random-access read
+
+struct Allpass {
+  ApDesign d; int nch = 0;
+  std::vector<double> st;   // per channel, per stage: 2 state values (direct form II transposed)
+  void setup(const ApDesign& dd, int nch_) { d = dd; nch = std::max(0, nch_); st.assign((size_t)nch * std::max(1, d.stages) * 2, 0.0); }
+  void reset() { std::fill(st.begin(), st.end(), 0.0); }
+  bool active() const { return d.type != 0 && d.stages > 0 && nch > 0; }
+  // in place, interleaved 'stride' channels; channels >= nch pass through
+  void process(double* buf, int nframes, int stride)
+  {
+    if (!active() || nframes <= 0) return;
+    const int nc = std::min(stride, nch);
+    for (int c = 0; c < nc; c++) {
+      for (int s = 0; s < d.stages; s++) {
+        double* z = &st[((size_t)c * d.stages + s) * 2];
+        double s1 = z[0], s2 = z[1];
+        double* p = buf + c;
+        if (d.type == 1) {
+          const double cc = d.c;
+          for (int i = 0; i < nframes; i++, p += stride) { double x = *p, y = cc * x + s1; s1 = x - cc * y; *p = y; }
+        } else {
+          const double b0 = d.b0, b1 = d.b1, b2 = d.b2, a1 = d.a1, a2 = d.a2;
+          for (int i = 0; i < nframes; i++, p += stride) { double x = *p, y = b0 * x + s1; s1 = b1 * x - a1 * y + s2; s2 = b2 * x - a2 * y; *p = y; }
+        }
+        z[0] = s1; z[1] = s2;
+      }
+    }
+  }
+};
+
+// Sequential allpass over random-access reads: remembers the filter state at the position where the
+// next read is expected to start, so consecutive reads (playback, peak building) need no warm-up.
+struct ApStream {
+  Allpass ap; bool have = false; double next_pos = -1; std::vector<double> snap;
+  bool continuous(double pos) const { return have && std::fabs(pos - next_pos) < 0.5; }
+  void prepare(const ApDesign& d, int nch) { if (!(ap.d == d) || ap.nch != nch) { ap.setup(d, nch); have = false; } }
+  // filter buf (nframes x stride) that starts at absolute frame position pos; the next read is expected at pos + advance
+  void run(double* buf, int nframes, int stride, double pos, int advance)
+  {
+    if (continuous(pos)) ap.st = snap; else ap.reset();
+    int a = std::max(0, std::min(advance, nframes));
+    ap.process(buf, a, stride);
+    snap = ap.st;
+    if (a < nframes) ap.process(buf + (size_t)a * stride, nframes - a, stride);
+    next_pos = pos + advance; have = true;
+  }
+};
+
 } // namespace dsp
 
 // ============================================================================ parameters
 struct Params {
   double angle_l = 0, angle_r = 0;
   int adaptive = 0, smooth = 0, bypass = 0, link = 1;
+  int ap_type = 0, ap_stages = 4;          // allpass rotator: 0 off, 1 first-order cascade, 2 second-order cascade
+  double ap_freq = 200, ap_q = 0.35;
+  bool ap_on() const { return ap_type != 0 && ap_stages > 0; }
+  bool rotates() const { return adaptive != 0 || angle_l != 0 || angle_r != 0; }
+  bool identity() const { return bypass != 0 || (!rotates() && !ap_on()); }
+  bool same_ap(const Params& o) const { return ap_type == o.ap_type && ap_stages == o.ap_stages && ap_freq == o.ap_freq && ap_q == o.ap_q; }
   bool operator==(const Params& o) const
-  { return angle_l == o.angle_l && angle_r == o.angle_r && adaptive == o.adaptive && smooth == o.smooth && bypass == o.bypass && link == o.link; }
+  { return angle_l == o.angle_l && angle_r == o.angle_r && adaptive == o.adaptive && smooth == o.smooth && bypass == o.bypass && link == o.link && same_ap(o); }
   bool operator!=(const Params& o) const { return !(*this == o); }
+  void clamp()
+  {
+    adaptive = adaptive ? 1 : 0; bypass = bypass ? 1 : 0; link = link ? 1 : 0;
+    smooth = std::min(2, std::max(0, smooth));
+    ap_type = std::min(2, std::max(0, ap_type));
+    ap_stages = std::min(16, std::max(1, ap_stages));
+    ap_freq = std::min(2000.0, std::max(20.0, ap_freq));
+    ap_q = std::min(10.0, std::max(0.1, ap_q));
+  }
   std::string serialize() const
   {
-    char b[128];
-    snprintf(b, sizeof(b), "1 %.4f %.4f %d %d %d %d", angle_l, angle_r, adaptive, smooth, bypass, link);
+    char b[192];
+    snprintf(b, sizeof(b), "2 %.4f %.4f %d %d %d %d %d %d %.3f %.4f", angle_l, angle_r, adaptive, smooth, bypass, link, ap_type, ap_stages, ap_freq, ap_q);
     return b;
   }
   static bool parse(const char* s, Params* p)
   {
     if (!s || !*s) return false;
-    int ver = 0, ad = 0, sm = 0, by = 0, li = 1; double al = 0, ar = 0;
-    if (sscanf(s, "%d %lf %lf %d %d %d %d", &ver, &al, &ar, &ad, &sm, &by, &li) < 3 || ver != 1) return false;
-    p->angle_l = al; p->angle_r = ar; p->adaptive = ad ? 1 : 0; p->smooth = std::min(2, std::max(0, sm)); p->bypass = by ? 1 : 0; p->link = li ? 1 : 0;
+    int ver = 0, ad = 0, sm = 0, by = 0, li = 1, at = 0, ast = 4; double al = 0, ar = 0, af = 200, aq = 0.35;
+    int n = sscanf(s, "%d %lf %lf %d %d %d %d %d %d %lf %lf", &ver, &al, &ar, &ad, &sm, &by, &li, &at, &ast, &af, &aq);
+    if (n < 3 || (ver != 1 && ver != 2)) return false;
+    Params q; q.angle_l = al; q.angle_r = ar; q.adaptive = ad; q.smooth = sm; q.bypass = by; q.link = li;
+    if (ver >= 2 && n >= 11) { q.ap_type = at; q.ap_stages = ast; q.ap_freq = af; q.ap_q = aq; }
+    q.clamp(); *p = q;
     return true;
   }
 };
@@ -169,10 +267,18 @@ class PhaseRotSource;
 static std::mutex g_registry_mutex;
 static std::vector<PhaseRotSource*> g_registry;   // live wrappers (for safe identification)
 
+// Playback-only override shared by a wrapper and all its Duplicate()s (REAPER reads takes through
+// duplicates: audio accessors, playback buffers), so a preview set on the take's wrapper is heard everywhere.
+struct PreviewState {
+  std::mutex m;
+  std::shared_ptr<Params> p;
+  std::shared_ptr<dsp::Trajectory> traj;
+};
+
 class PhaseRotSource : public PCM_source
 {
 public:
-  PhaseRotSource(PCM_source* child, const Params& p) : m_child(child), m_params(p)
+  PhaseRotSource(PCM_source* child, const Params& p) : m_child(child), m_params(p), m_prev(std::make_shared<PreviewState>())
   {
     dbg_created = time_precise();
     std::lock_guard<std::mutex> lk(g_registry_mutex);
@@ -209,7 +315,7 @@ public:
     bool need_traj;
     {
       std::lock_guard<std::mutex> lk(m_mutex);
-      need_traj = p.adaptive && (!m_params.adaptive || p.smooth != m_params.smooth || p.link != m_params.link || !m_traj);
+      need_traj = p.adaptive && (!m_params.adaptive || p.smooth != m_params.smooth || p.link != m_params.link || !p.same_ap(m_params) || !m_traj);
       m_params = p;
       m_peaks_valid = false;
       if (need_traj) m_traj = nullptr;
@@ -220,6 +326,24 @@ public:
       m_traj = t;
     }
   }
+  // Preview: parameters used for PLAYBACK only (GetSamples). Peaks, project and undo keep the
+  // committed parameters, so the user hears the staged settings while the waveform shows the applied ones.
+  void set_preview(const Params* p)
+  {
+    std::shared_ptr<Params> np; std::shared_ptr<dsp::Trajectory> nt;
+    if (p) {
+      np = std::make_shared<Params>(*p); np->bypass = 0;
+      if (np->adaptive) {
+        std::shared_ptr<Params> cur; { std::lock_guard<std::mutex> lk(m_prev->m); cur = m_prev->p; nt = m_prev->traj; }
+        if (!(cur && nt && cur->adaptive && cur->smooth == np->smooth && cur->link == np->link && cur->same_ap(*np))) nt = build_trajectory(*np);
+      }
+    }
+    std::lock_guard<std::mutex> lk(m_prev->m);
+    m_prev->p = np; m_prev->traj = nt;
+  }
+  bool has_preview() { std::lock_guard<std::mutex> lk(m_prev->m); return m_prev->p != nullptr; }
+  // a replacement wrapper (parameter change) keeps sharing the preview state of the one it replaces
+  void copy_preview_from(PhaseRotSource* o) { m_prev = o->m_prev; }
 
   // ---- PCM_source
   PCM_source* Duplicate() override
@@ -230,6 +354,7 @@ public:
     { std::lock_guard<std::mutex> lk(m_mutex); p = m_params; t = m_traj; }
     PhaseRotSource* d = new PhaseRotSource(c, p);
     d->m_traj = t;
+    d->m_prev = m_prev;     // duplicates hear the same preview
     return d;
   }
   bool IsAvailable() override { return m_child && m_child->IsAvailable(); }
@@ -270,12 +395,17 @@ public:
     dbg_samples++;
     if (!m_child) { block->samples_out = 0; return; }
     Params p; std::shared_ptr<dsp::Trajectory> tr;
-    { std::lock_guard<std::mutex> lk(m_mutex); p = m_params; tr = m_traj; }
-    if (p.bypass || (!p.adaptive && p.angle_l == 0 && p.angle_r == 0)) {
+    bool have_prev = false;
+    { std::lock_guard<std::mutex> lk(m_prev->m); if (m_prev->p) { p = *m_prev->p; tr = m_prev->traj; have_prev = true; } }
+    if (!have_prev) { std::lock_guard<std::mutex> lk(m_mutex); p = m_params; tr = m_traj; }
+    if (p.identity()) {
       m_child->GetSamples(block);
       return;
     }
-    render(m_child, block->time_s, block->samplerate, block->nch, block->length, block->samples, &block->samples_out, p, tr);
+    // the allpass state follows consecutive reads of the audio thread; a concurrent reader gets its own warm-up
+    std::unique_lock<std::mutex> lk(m_ap_audio_mutex, std::try_to_lock);
+    render(m_child, block->time_s, block->samplerate, block->nch, block->length, block->samples, &block->samples_out, p, tr,
+           lk.owns_lock() ? &m_ap_audio : nullptr);
     block->midi_events = nullptr;
   }
 
@@ -288,7 +418,7 @@ public:
     if (!m_child) return;
     Params p; std::shared_ptr<dsp::Trajectory> tr;
     { std::lock_guard<std::mutex> lk(m_mutex); p = m_params; tr = m_traj; }
-    if (p.bypass || (!p.adaptive && p.angle_l == 0 && p.angle_r == 0)) {
+    if (p.identity()) {
       m_child->GetPeakInfo(block);
       return;
     }
@@ -307,7 +437,7 @@ public:
       if (nfr > 4 * 1024 * 1024) return;
       std::vector<double> buf((size_t)nfr * nch);
       int got = 0;
-      render(ui_child(), block->start_time, sr, nch, nfr, buf.data(), &got, p, tr);
+      render(ui_child(), block->start_time, sr, nch, nfr, buf.data(), &got, p, tr, nullptr);
       int outp = 0;
       for (int i = 0; i < npts; i++) {
         double t0 = block->start_time + i / block->peakrate;
@@ -359,23 +489,47 @@ public:
 
   // Render 'length' frames at 'srate' starting at time_s into out (interleaved nch), rotated.
   // 'src' is the decoder to read from (m_child on the audio thread, ui_child() elsewhere).
+  // 'stream' keeps the allpass state between consecutive reads (nullptr = warm up from scratch).
   void render(PCM_source* src, double time_s, double srate, int nch, int length, double* out, int* out_frames,
-              const Params& p, const std::shared_ptr<dsp::Trajectory>& traj)
+              const Params& p, const std::shared_ptr<dsp::Trajectory>& traj, dsp::ApStream* stream)
   {
     *out_frames = 0;
     if (!src || length <= 0 || nch <= 0 || srate < 1) return;
-    auto kern = dsp::kernel_for(srate);
-    const int D = kern->D, M = kern->M, N = kern->N, hop = kern->hop;
-    // input needed: [time_s - D/sr, time_s + (length + D)/sr)
-    const int nin = length + (M - 1);
+    dsp::ApStream local_stream;
+    if (!stream) stream = &local_stream;
+    const bool ap = p.ap_on();
+    if (ap) stream->prepare(dsp::ap_design(p.ap_type, p.ap_stages, p.ap_freq, p.ap_q, srate), std::min(2, nch));
     static thread_local std::vector<double> in;          // reused: no allocation in steady state
     static thread_local std::vector<WDL_FFT_COMPLEX> fbuf;
-    if (in.size() < (size_t)nin * nch) in.resize((size_t)nin * nch);
+    if (!p.rotates()) {
+      // allpass only: no FIR context needed
+      const double pos = time_s * srate;
+      const int PRE = stream->continuous(pos) ? 0 : dsp::ap_preroll(srate);
+      const size_t need = (size_t)(PRE + length) * nch;
+      if (in.size() < need) in.resize(need);
+      std::fill(in.begin(), in.begin() + need, 0.0);
+      int nvalid = fetch_child(src, time_s - (double)PRE / srate, srate, nch, PRE + length, in.data()) - PRE;
+      if (nvalid <= 0 && time_s >= GetLength()) return;
+      stream->run(in.data(), PRE + length, nch, pos - PRE, PRE + length);
+      memcpy(out, in.data() + (size_t)PRE * nch, sizeof(double) * (size_t)length * nch);
+      *out_frames = std::min(length, std::max(0, nvalid));
+      if (*out_frames < length && time_s + (double)length / srate <= GetLength() + 1e-9) *out_frames = length;
+      return;
+    }
+    auto kern = dsp::kernel_for(srate);
+    const int D = kern->D, M = kern->M, N = kern->N, hop = kern->hop;
+    // input needed: [time_s - D/sr, time_s + (length + D)/sr)  (+ allpass warm-up before it)
+    const int nin = length + (M - 1);
+    const double t_in = time_s - (double)D / srate;
+    const double pos = t_in * srate;
+    const int PRE = (ap && !stream->continuous(pos)) ? dsp::ap_preroll(srate) : 0;
+    if (in.size() < (size_t)(PRE + nin) * nch) in.resize((size_t)(PRE + nin) * nch);
     if (fbuf.size() < (size_t)N) fbuf.resize(N);
-    std::fill(in.begin(), in.begin() + (size_t)nin * nch, 0.0);
-    double t_in = time_s - (double)D / srate;
-    int nvalid_in = fetch_child(src, t_in, srate, nch, nin, in.data());
+    std::fill(in.begin(), in.begin() + (size_t)(PRE + nin) * nch, 0.0);
+    int nvalid_in = fetch_child(src, t_in - (double)PRE / srate, srate, nch, PRE + nin, in.data()) - PRE;
     if (nvalid_in <= 0 && time_s >= GetLength()) return;
+    if (ap) stream->run(in.data(), PRE + nin, nch, pos - PRE, PRE + length);
+    const double* IN = in.data() + (size_t)PRE * nch;
 
     const double a_l = p.angle_l * PI / 180, a_r = p.angle_r * PI / 180;
     const double cl = std::cos(a_l), sl = std::sin(a_l), cr = std::cos(a_r), sr_ = std::sin(a_r);
@@ -386,8 +540,8 @@ public:
       if (!rot_c0 && !rot_c1) {
         // channels beyond the first two pass through untouched
         for (int f = 0; f < length; f++) {
-          out[(size_t)f * nch + c0] = in[(size_t)(f + D) * nch + c0];
-          if (c1 >= 0) out[(size_t)f * nch + c1] = in[(size_t)(f + D) * nch + c1];
+          out[(size_t)f * nch + c0] = IN[(size_t)(f + D) * nch + c0];
+          if (c1 >= 0) out[(size_t)f * nch + c1] = IN[(size_t)(f + D) * nch + c1];
         }
         continue;
       }
@@ -395,7 +549,7 @@ public:
         // block input frames [start, start + N) of 'in' (zero beyond nin)
         for (int j = 0; j < N; j++) {
           int f = start + j;
-          if (f < nin) { fbuf[j].re = in[(size_t)f * nch + c0]; fbuf[j].im = c1 >= 0 ? in[(size_t)f * nch + c1] : 0.0; }
+          if (f < nin) { fbuf[j].re = IN[(size_t)f * nch + c0]; fbuf[j].im = c1 >= 0 ? IN[(size_t)f * nch + c1] : 0.0; }
           else { fbuf[j].re = 0; fbuf[j].im = 0; }
         }
         dsp::hilbert_block(*kern, fbuf.data());
@@ -403,8 +557,8 @@ public:
         for (int i = 0; i < nout; i++) {
           int f = start + i;                 // output frame
           int j = i + (M - 1);               // FFT index with valid linear convolution
-          double xl = in[(size_t)(f + D) * nch + c0], hl = fbuf[j].re;
-          double xr = c1 >= 0 ? in[(size_t)(f + D) * nch + c1] : 0.0, hr = fbuf[j].im;
+          double xl = IN[(size_t)(f + D) * nch + c0], hl = fbuf[j].re;
+          double xr = c1 >= 0 ? IN[(size_t)(f + D) * nch + c1] : 0.0, hr = fbuf[j].im;
           double cL = cl, sL = sl, cR = cr, sR = sr_;
           if (p.adaptive && traj) {
             double t = time_s + (double)f / srate;
@@ -432,7 +586,7 @@ private:
   {
     int skip = 0;
     if (t < 0) {
-      skip = (int)std::ceil(-t * srate);
+      skip = (int)std::ceil(-t * srate - 1e-6);   // positions are sample-aligned; guard against 28096.0000000001
       if (skip >= nframes) return 0;
       t += (double)skip / srate;
     }
@@ -470,10 +624,11 @@ private:
     auto kern = dsp::kernel_for(sr);
     const int chunk = kern->hop * 2;
     std::vector<double> buf((size_t)chunk * nch);
+    dsp::ApStream stream;
     for (long long start = 0; start < nframes; start += chunk) {
       int n = (int)std::min<long long>(chunk, nframes - start);
       int got = 0;
-      render(src, (double)start / sr, sr, nch, n, buf.data(), &got, p, tr);
+      render(src, (double)start / sr, sr, nch, n, buf.data(), &got, p, tr, &stream);
       for (int f = 0; f < n; f++) {
         int b = (int)((start + f) / PEAK_BIN);
         for (int c = 0; c < nch; c++) {
@@ -515,6 +670,9 @@ private:
     std::vector<double> bins[2] = { std::vector<double>(NB), std::vector<double>(NB) };
     double runpk2[2] = {0, 0}, prev[2] = {0, 0};
     const bool linked = p.link != 0 || nch < 2;
+    const bool ap = p.ap_on();
+    dsp::ApStream stream;
+    if (ap) stream.prepare(dsp::ap_design(p.ap_type, p.ap_stages, p.ap_freq, p.ap_q, sr), nch);
     int sub_index = 0;
     auto search = [&](const std::vector<double>& b, double prevdeg) {
       double cost[180]; double best = -1; int bestt = 0;
@@ -537,16 +695,20 @@ private:
     for (long long start = 0; start < nframes; start += chunk) {
       int n = (int)std::min<long long>(chunk, nframes - start);
       const int nin = n + (M - 1);
-      in.assign((size_t)nin * nch, 0.0);
-      fetch_child(src, (double)start / sr - (double)D / sr, sr, nch, nin, in.data());
+      const double t = (double)start / sr - (double)D / sr, pos = t * sr;
+      const int PRE = (ap && !stream.continuous(pos)) ? dsp::ap_preroll(sr) : 0;
+      in.assign((size_t)(PRE + nin) * nch, 0.0);
+      fetch_child(src, t - (double)PRE / sr, sr, nch, PRE + nin, in.data());
+      if (ap) stream.run(in.data(), PRE + nin, nch, pos - PRE, PRE + n);
+      const double* IN = in.data() + (size_t)PRE * nch;
       for (int j = 0; j < N; j++) {
-        if (j < nin) { fbuf[j].re = in[(size_t)j * nch]; fbuf[j].im = nch > 1 ? in[(size_t)j * nch + 1] : 0.0; }
+        if (j < nin) { fbuf[j].re = IN[(size_t)j * nch]; fbuf[j].im = nch > 1 ? IN[(size_t)j * nch + 1] : 0.0; }
         else fbuf[j].re = fbuf[j].im = 0;
       }
       dsp::hilbert_block(*kern, fbuf.data());
       for (int f = 0; f < n; f++) {
-        x[(size_t)f * 2] = in[(size_t)(f + D) * nch]; h[(size_t)f * 2] = fbuf[f + M - 1].re;
-        x[(size_t)f * 2 + 1] = nch > 1 ? in[(size_t)(f + D) * nch + 1] : 0.0; h[(size_t)f * 2 + 1] = fbuf[f + M - 1].im;
+        x[(size_t)f * 2] = IN[(size_t)(f + D) * nch]; h[(size_t)f * 2] = fbuf[f + M - 1].re;
+        x[(size_t)f * 2 + 1] = nch > 1 ? IN[(size_t)(f + D) * nch + 1] : 0.0; h[(size_t)f * 2 + 1] = fbuf[f + M - 1].im;
       }
       for (int s0 = 0; s0 < n; s0 += SUB) {
         int s1 = std::min(n, s0 + SUB);
@@ -611,8 +773,10 @@ private:
   PCM_source* m_ui_child = nullptr;
   bool m_owns_child = true;
   Params m_params;
-  std::mutex m_mutex, m_build_mutex, m_ui_mutex;
+  std::mutex m_mutex, m_build_mutex, m_ui_mutex, m_ap_audio_mutex;
   std::shared_ptr<dsp::Trajectory> m_traj;
+  std::shared_ptr<PreviewState> m_prev;              // playback-only override (see set_preview), shared with duplicates
+  dsp::ApStream m_ap_audio;                          // allpass state of the audio thread's consecutive reads
   std::vector<float> m_peak_max, m_peak_min;
   int m_peak_nbins = 0, m_peak_nch = 0;
   bool m_peaks_valid = false;
@@ -691,6 +855,7 @@ static bool sync_take(MediaItem_Take* take)
       // same child; the old one is parked in the graveyard until the audio thread is out.
       PhaseRotSource* w2 = new PhaseRotSource(w->detach(), Params());
       w2->set_params(p);
+      w2->copy_preview_from(w);
       GetSetMediaItemTakeInfo(take, "P_SOURCE", w2);
       bury_wrapper(w);
       return true;
@@ -698,9 +863,18 @@ static bool sync_take(MediaItem_Take* take)
     return false;
   }
   if (wrapped) {
+    PhaseRotSource* w = (PhaseRotSource*)src;
+    if (w->has_preview()) {
+      // nothing applied but a preview is running: keep the wrapper, with identity as the committed state
+      if (w->params() == Params()) return false;
+      PhaseRotSource* w2 = new PhaseRotSource(w->detach(), Params());
+      w2->copy_preview_from(w);
+      GetSetMediaItemTakeInfo(take, "P_SOURCE", w2);
+      bury_wrapper(w);
+      return true;
+    }
     // same reason: give REAPER a fresh copy of the original source so the waveform redraws;
     // the wrapper keeps (and later frees) the child it was reading from
-    PhaseRotSource* w = (PhaseRotSource*)src;
     PCM_source* fresh = w->child() ? w->child()->Duplicate() : nullptr;
     if (fresh) GetSetMediaItemTakeInfo(take, "P_SOURCE", fresh);
     else GetSetMediaItemTakeInfo(take, "P_SOURCE", w->detach());
@@ -833,7 +1007,7 @@ static double db(double v) { return v <= 1e-12 ? -240.0 : 20 * std::log10(v); }
 // Analyse the ORIGINAL audio of the take (child if wrapped), over the part of the source the
 // item actually plays (start offset, length, play rate) and through the take's channel mode.
 // Result text goes to ExtState phaserot/analysis.
-static bool analyze_take(MediaItem_Take* take)
+static bool analyze_take(MediaItem_Take* take, const Params& ap_params)
 {
   SetExtState("phaserot", "analysis", "", false);
   PCM_source* base = (PCM_source*)GetSetMediaItemTakeInfo(take, "P_SOURCE", nullptr);
@@ -866,7 +1040,11 @@ static bool analyze_take(MediaItem_Take* take)
   const int N = kern->N, M = kern->M, D = kern->D, hop = kern->hop;
   std::vector<WDL_FFT_COMPLEX> fbuf(N);
   std::vector<double> raw, in;
+  const bool ap = ap_params.ap_on();
+  dsp::ApStream stream;
+  if (ap) stream.prepare(dsp::ap_design(ap_params.ap_type, ap_params.ap_stages, ap_params.ap_freq, ap_params.ap_q, sr), nch);
   ana::ChanStats cs[2];
+  double orig_peak[2] = {0, 0};   // peak of the ORIGINAL audio (before the allpass rotator)
   for (int c = 0; c < 2; c++) { cs[c].bins_max.assign(ana::NBINS, 0.0); cs[c].s8.assign(ana::NC, 0.0); }
   const double K = ana::NBINS / (2 * PI), THR2 = 0.01;
   auto pick = [&](const double* fr, int which) {
@@ -877,31 +1055,37 @@ static bool analyze_take(MediaItem_Take* take)
   for (long long start = 0; start < nframes; start += hop) {
     int n = (int)std::min<long long>(hop, nframes - start);
     int nin = n + (M - 1);
-    raw.assign((size_t)nin * src_nch, 0.0);
-    in.assign((size_t)nin * nch, 0.0);
-    double t = t_start + (double)start / sr - (double)D / sr;
+    const double t0 = t_start + (double)start / sr - (double)D / sr, pos = t0 * sr;
+    const int PRE = (ap && !stream.continuous(pos)) ? dsp::ap_preroll(sr) : 0;
+    const int ntot = PRE + nin;
+    raw.assign((size_t)ntot * src_nch, 0.0);
+    in.assign((size_t)ntot * nch, 0.0);
+    double t = t0 - (double)PRE / sr;
     int skip = 0;
-    if (t < 0) { skip = (int)std::ceil(-t * sr); t += (double)skip / sr; }
-    if (skip < nin) {
+    if (t < 0) { skip = (int)std::ceil(-t * sr - 1e-6); t += (double)skip / sr; }
+    if (skip < ntot) {
       PCM_source_transfer_t tr; memset(&tr, 0, sizeof(tr));
-      tr.time_s = t; tr.samplerate = sr; tr.nch = src_nch; tr.length = nin - skip; tr.samples = raw.data() + (size_t)skip * src_nch;
+      tr.time_s = t; tr.samplerate = sr; tr.nch = src_nch; tr.length = ntot - skip; tr.samples = raw.data() + (size_t)skip * src_nch;
       src->GetSamples(&tr);
       if (tr.samples_out < tr.length && tr.samples_out >= 0) memset(raw.data() + (size_t)(skip + tr.samples_out) * src_nch, 0, sizeof(double) * (size_t)(tr.length - tr.samples_out) * src_nch);
     }
     // samples beyond the item window (only the FIR context reaches there) are used as-is: that is what plays
-    for (int j = 0; j < nin; j++) {
+    for (int j = 0; j < ntot; j++) {
       const double* fr = &raw[(size_t)j * src_nch];
       in[(size_t)j * nch] = pick(fr, 0);
       if (nch > 1) in[(size_t)j * nch + 1] = pick(fr, 1);
     }
+    for (int f = 0; f < n; f++) for (int c = 0; c < nch; c++) { double v = std::fabs(in[(size_t)(PRE + f + D) * nch + c]); if (v > orig_peak[c]) orig_peak[c] = v; }
+    if (ap) stream.run(in.data(), ntot, nch, pos - PRE, PRE + n);
+    const double* IN = in.data() + (size_t)PRE * nch;
     for (int j = 0; j < N; j++) {
-      if (j < nin) { fbuf[j].re = in[(size_t)j * nch]; fbuf[j].im = nch > 1 ? in[(size_t)j * nch + 1] : 0.0; }
+      if (j < nin) { fbuf[j].re = IN[(size_t)j * nch]; fbuf[j].im = nch > 1 ? IN[(size_t)j * nch + 1] : 0.0; }
       else fbuf[j].re = fbuf[j].im = 0;
     }
     dsp::hilbert_block(*kern, fbuf.data());
     for (int f = 0; f < n; f++) {
       for (int c = 0; c < nch; c++) {
-        double x = in[(size_t)(f + D) * nch + c];
+        double x = IN[(size_t)(f + D) * nch + c];
         double h = c == 0 ? fbuf[f + M - 1].re : fbuf[f + M - 1].im;
         ana::ChanStats& st = cs[c];
         if (x > st.pos) st.pos = x; else if (-x > st.neg) st.neg = -x;
@@ -921,7 +1105,7 @@ static bool analyze_take(MediaItem_Take* take)
   const double len = t_end - t_start;
   std::string res;
   char line[256];
-  snprintf(line, sizeof(line), "nch=%d sr=%.0f length=%.6f ", nch, sr, len); res += line;
+  snprintf(line, sizeof(line), "nch=%d sr=%.0f length=%.6f ap=%d,%d,%.3f,%.4f ", nch, sr, len, ap ? ap_params.ap_type : 0, ap_params.ap_stages, ap_params.ap_freq, ap_params.ap_q); res += line;
   std::vector<double> cmax[2], c8[2];
   double peak_before = 0;
   for (int c = 0; c < nch; c++) {
@@ -942,8 +1126,8 @@ static bool analyze_take(MediaItem_Take* take)
       l8[t] = nch > 1 ? c8[0][t] + c8[1][t] : c8[0][t];
     }
     int t_rx = ana::pick_min(l8, 1e-6), t_pk = ana::pick_min(cl, std::pow(10.0, 0.01 / 20) - 1);
-    snprintf(line, sizeof(line), "linked_rx=%.4f linked_peak=%.4f linked_after_rx=%.6f linked_minpeak=%.6f peak_before=%.6f ",
-             -90 + t_rx * ana::STEP, -90 + t_pk * ana::STEP, cl[t_rx], cl[t_pk], peak_before);
+    snprintf(line, sizeof(line), "linked_rx=%.4f linked_peak=%.4f linked_after_rx=%.6f linked_minpeak=%.6f peak_before=%.6f peak_orig=%.6f ",
+             -90 + t_rx * ana::STEP, -90 + t_pk * ana::STEP, cl[t_rx], cl[t_pk], peak_before, std::max(orig_peak[0], nch > 1 ? orig_peak[1] : 0.0));
     res += line;
   }
   // polar shapes (360 values per channel, max envelope per degree)
@@ -965,10 +1149,17 @@ static bool valid_take(MediaItem_Take* take)
   return take && ValidatePtr2(nullptr, take, "MediaItem_Take*");
 }
 
-static bool API_PhaseRot_SetTake(MediaItem_Take* take, double angle_l, double angle_r, int adaptive, int smooth, int bypass, int link)
+static Params make_params(double angle_l, double angle_r, int adaptive, int smooth, int bypass, int link, int ap_type, int ap_stages, double ap_freq, double ap_q)
+{
+  Params p; p.angle_l = angle_l; p.angle_r = angle_r; p.adaptive = adaptive; p.smooth = smooth; p.bypass = bypass; p.link = link;
+  p.ap_type = ap_type; p.ap_stages = ap_stages; p.ap_freq = ap_freq; p.ap_q = ap_q;
+  p.clamp();
+  return p;
+}
+static bool API_PhaseRot_SetTake(MediaItem_Take* take, double angle_l, double angle_r, int adaptive, int smooth, int bypass, int link, int ap_type, int ap_stages, double ap_freq, double ap_q)
 {
   if (!valid_take(take) || TakeIsMIDI(take)) return false;
-  Params p; p.angle_l = angle_l; p.angle_r = angle_r; p.adaptive = adaptive ? 1 : 0; p.smooth = std::min(2, std::max(0, smooth)); p.bypass = bypass ? 1 : 0; p.link = link ? 1 : 0;
+  Params p = make_params(angle_l, angle_r, adaptive, smooth, bypass, link, ap_type, ap_stages, ap_freq, ap_q);
   take_set_ext(take, &p);
   bool changed = sync_take(take);
   MediaItem* item = GetMediaItemTake_Item(take);
@@ -986,7 +1177,8 @@ static bool API_PhaseRot_ClearTake(MediaItem_Take* take)
   if (changed) refresh_peak_display();
   return true;
 }
-static bool API_PhaseRot_GetTake(MediaItem_Take* take, double* angle_lOut, double* angle_rOut, int* adaptiveOut, int* smoothOut, int* bypassOut, int* linkOut)
+static bool API_PhaseRot_GetTake(MediaItem_Take* take, double* angle_lOut, double* angle_rOut, int* adaptiveOut, int* smoothOut, int* bypassOut, int* linkOut,
+                                 int* ap_typeOut, int* ap_stagesOut, double* ap_freqOut, double* ap_qOut)
 {
   if (!valid_take(take)) return false;
   Params p;
@@ -997,12 +1189,64 @@ static bool API_PhaseRot_GetTake(MediaItem_Take* take, double* angle_lOut, doubl
   if (smoothOut) *smoothOut = p.smooth;
   if (bypassOut) *bypassOut = p.bypass;
   if (linkOut) *linkOut = p.link;
+  if (ap_typeOut) *ap_typeOut = p.ap_type;
+  if (ap_stagesOut) *ap_stagesOut = p.ap_stages;
+  if (ap_freqOut) *ap_freqOut = p.ap_freq;
+  if (ap_qOut) *ap_qOut = p.ap_q;
   return true;
 }
-static bool API_PhaseRot_Analyze(MediaItem_Take* take)
+static bool API_PhaseRot_AnalyzeEx(MediaItem_Take* take, int ap_type, int ap_stages, double ap_freq, double ap_q)
 {
   if (!valid_take(take) || TakeIsMIDI(take)) return false;
-  return analyze_take(take);
+  Params p = make_params(0, 0, 0, 0, 0, 1, ap_type, ap_stages, ap_freq, ap_q);
+  return analyze_take(take, p);
+}
+static bool API_PhaseRot_Analyze(MediaItem_Take* take) { return API_PhaseRot_AnalyzeEx(take, 0, 4, 200, 0.35); }
+// Preview: audition parameters on the take without touching P_EXT (project/undo) or the waveform.
+static bool API_PhaseRot_SetPreview(MediaItem_Take* take, double angle_l, double angle_r, int adaptive, int smooth, int link, int ap_type, int ap_stages, double ap_freq, double ap_q)
+{
+  if (!valid_take(take) || TakeIsMIDI(take)) return false;
+  Params p = make_params(angle_l, angle_r, adaptive, smooth, 0, link, ap_type, ap_stages, ap_freq, ap_q);
+  PCM_source* src = (PCM_source*)GetSetMediaItemTakeInfo(take, "P_SOURCE", nullptr);
+  if (PhaseRotSource::is_wrapper(src)) { ((PhaseRotSource*)src)->set_preview(&p); return true; }
+  if (!src || src->GetNumChannels() <= 0 || src->GetSampleRate() < 1 || chain_has_wrapper(src)) return false;
+  Params committed;
+  if (!take_ext(take, &committed)) committed = Params();
+  PhaseRotSource* w = new PhaseRotSource(src, Params());
+  w->set_params(committed);
+  w->set_preview(&p);
+  GetSetMediaItemTakeInfo(take, "P_SOURCE", w);
+  MediaItem* item = GetMediaItemTake_Item(take);
+  if (item) UpdateItemInProject(item);
+  return true;
+}
+static bool API_PhaseRot_ClearPreview(MediaItem_Take* take)
+{
+  if (!valid_take(take)) return false;
+  PCM_source* src = (PCM_source*)GetSetMediaItemTakeInfo(take, "P_SOURCE", nullptr);
+  if (!PhaseRotSource::is_wrapper(src)) return true;
+  ((PhaseRotSource*)src)->set_preview(nullptr);
+  bool changed = sync_take(take);
+  MediaItem* item = GetMediaItemTake_Item(take);
+  if (item) UpdateItemInProject(item);
+  if (changed) refresh_peak_display();
+  return true;
+}
+static void API_PhaseRot_ClearAllPreviews()
+{
+  for (int pi = 0;; pi++) {
+    ReaProject* proj = EnumProjects(pi, nullptr, 0);
+    if (!proj) break;
+    for (int i = 0; i < CountMediaItems(proj); i++) {
+      MediaItem* item = GetMediaItem(proj, i);
+      for (int t = 0; t < CountTakes(item); t++) {
+        MediaItem_Take* take = GetTake(item, t);
+        PCM_source* src = take ? (PCM_source*)GetSetMediaItemTakeInfo(take, "P_SOURCE", nullptr) : nullptr;
+        if (PhaseRotSource::is_wrapper(src)) ((PhaseRotSource*)src)->set_preview(nullptr);
+      }
+    }
+  }
+  scan_all_projects();
 }
 static void API_PhaseRot_Refresh() { scan_all_projects(); }
 // debug: counters of the take's current wrapper -> ExtState phaserot/debug
@@ -1024,31 +1268,55 @@ static void* VA_PhaseRot_GetDebug(void** a, int n) { return (void*)(INT_PTR)API_
 static const char* API_PhaseRot_GetVersion() { return PR_VERSION; }
 
 // vararg wrappers (ReaScript)
+static double dbl_arg(void** a, int n, int i, double def) { return (n > i && a[i]) ? *(double*)a[i] : def; }
+static int int_arg(void** a, int n, int i, int def) { return n > i ? (int)(INT_PTR)a[i] : def; }
 static void* VA_PhaseRot_SetTake(void** a, int n)
 {
-  return (void*)(INT_PTR)API_PhaseRot_SetTake((MediaItem_Take*)a[0], a[1] ? *(double*)a[1] : 0.0, a[2] ? *(double*)a[2] : 0.0,
-                                              (int)(INT_PTR)a[3], (int)(INT_PTR)a[4], (int)(INT_PTR)a[5], n > 6 ? (int)(INT_PTR)a[6] : 1);
+  return (void*)(INT_PTR)API_PhaseRot_SetTake((MediaItem_Take*)a[0], dbl_arg(a, n, 1, 0), dbl_arg(a, n, 2, 0),
+                                              int_arg(a, n, 3, 0), int_arg(a, n, 4, 0), int_arg(a, n, 5, 0), int_arg(a, n, 6, 1),
+                                              int_arg(a, n, 7, 0), int_arg(a, n, 8, 4), dbl_arg(a, n, 9, 200), dbl_arg(a, n, 10, 0.35));
 }
 static void* VA_PhaseRot_ClearTake(void** a, int n) { return (void*)(INT_PTR)API_PhaseRot_ClearTake((MediaItem_Take*)a[0]); }
 static void* VA_PhaseRot_GetTake(void** a, int n)
 {
-  return (void*)(INT_PTR)API_PhaseRot_GetTake((MediaItem_Take*)a[0], (double*)a[1], (double*)a[2], (int*)a[3], (int*)a[4], (int*)a[5], n > 6 ? (int*)a[6] : nullptr);
+  return (void*)(INT_PTR)API_PhaseRot_GetTake((MediaItem_Take*)a[0], (double*)a[1], (double*)a[2], (int*)a[3], (int*)a[4], (int*)a[5], n > 6 ? (int*)a[6] : nullptr,
+                                              n > 7 ? (int*)a[7] : nullptr, n > 8 ? (int*)a[8] : nullptr, n > 9 ? (double*)a[9] : nullptr, n > 10 ? (double*)a[10] : nullptr);
 }
 static void* VA_PhaseRot_Analyze(void** a, int n) { return (void*)(INT_PTR)API_PhaseRot_Analyze((MediaItem_Take*)a[0]); }
+static void* VA_PhaseRot_AnalyzeEx(void** a, int n)
+{
+  return (void*)(INT_PTR)API_PhaseRot_AnalyzeEx((MediaItem_Take*)a[0], int_arg(a, n, 1, 0), int_arg(a, n, 2, 4), dbl_arg(a, n, 3, 200), dbl_arg(a, n, 4, 0.35));
+}
+static void* VA_PhaseRot_SetPreview(void** a, int n)
+{
+  return (void*)(INT_PTR)API_PhaseRot_SetPreview((MediaItem_Take*)a[0], dbl_arg(a, n, 1, 0), dbl_arg(a, n, 2, 0), int_arg(a, n, 3, 0), int_arg(a, n, 4, 0), int_arg(a, n, 5, 1),
+                                                 int_arg(a, n, 6, 0), int_arg(a, n, 7, 4), dbl_arg(a, n, 8, 200), dbl_arg(a, n, 9, 0.35));
+}
+static void* VA_PhaseRot_ClearPreview(void** a, int n) { return (void*)(INT_PTR)API_PhaseRot_ClearPreview((MediaItem_Take*)a[0]); }
+static void* VA_PhaseRot_ClearAllPreviews(void** a, int n) { API_PhaseRot_ClearAllPreviews(); return nullptr; }
 static void* VA_PhaseRot_Refresh(void** a, int n) { API_PhaseRot_Refresh(); return nullptr; }
 static void* VA_PhaseRot_GetVersion(void** a, int n) { return (void*)API_PhaseRot_GetVersion(); }
 
 struct ApiEntry { const char* name; void* func; void* vararg; const char* def; };
 static ApiEntry g_api[] = {
   { "PhaseRot_SetTake", (void*)API_PhaseRot_SetTake, (void*)VA_PhaseRot_SetTake,
-    "bool\0MediaItem_Take*,double,double,int,int,int,int\0take,angle_l,angle_r,adaptive,smooth,bypass,link\0"
-    "Apply a broadband phase rotation (degrees, same sign convention as iZotope RX) to the take non-destructively: the take's source is wrapped at runtime, the project file stays a plain project. adaptive=1 follows the signal (smooth 0..2; link=1 tracks one angle for both channels, 0 per channel), bypass=1 keeps the settings but passes audio through. Undo-able when called inside Undo_BeginBlock/EndBlock." },
+    "bool\0MediaItem_Take*,double,double,int,int,int,int,int,int,double,double\0take,angle_l,angle_r,adaptive,smooth,bypass,link,ap_type,ap_stages,ap_freq,ap_q\0"
+    "Apply a phase rotation to the take non-destructively: the take's source is wrapped at runtime, the project file stays a plain project. angle_l/angle_r in degrees (same sign convention as iZotope RX); adaptive=1 follows the signal (smooth 0..2; link=1 tracks one angle for both channels, 0 per channel); bypass=1 keeps the settings but passes audio through. Optional allpass rotator (broadcast style, runs before the rotation): ap_type 0=off, 1=cascade of first-order allpass sections (Orban: 4 stages at 200 Hz), 2=cascade of second-order sections with ap_q; ap_stages 1..16, ap_freq in Hz. Undo-able when called inside Undo_BeginBlock/EndBlock." },
   { "PhaseRot_ClearTake", (void*)API_PhaseRot_ClearTake, (void*)VA_PhaseRot_ClearTake,
     "bool\0MediaItem_Take*\0take\0Remove the phase rotation from the take (restores the original source)." },
   { "PhaseRot_GetTake", (void*)API_PhaseRot_GetTake, (void*)VA_PhaseRot_GetTake,
-    "bool\0MediaItem_Take*,double*,double*,int*,int*,int*,int*\0take,angle_lOut,angle_rOut,adaptiveOut,smoothOut,bypassOut,linkOut\0Get the phase rotation settings of the take. Returns false if the take has none." },
+    "bool\0MediaItem_Take*,double*,double*,int*,int*,int*,int*,int*,int*,double*,double*\0take,angle_lOut,angle_rOut,adaptiveOut,smoothOut,bypassOut,linkOut,ap_typeOut,ap_stagesOut,ap_freqOut,ap_qOut\0Get the phase rotation settings of the take. Returns false if the take has none." },
+  { "PhaseRot_SetPreview", (void*)API_PhaseRot_SetPreview, (void*)VA_PhaseRot_SetPreview,
+    "bool\0MediaItem_Take*,double,double,int,int,int,int,int,double,double\0take,angle_l,angle_r,adaptive,smooth,link,ap_type,ap_stages,ap_freq,ap_q\0"
+    "Audition settings on the take: playback uses these parameters while the project, undo history and the waveform keep the applied settings (or the original if nothing is applied). Not saved; clear with PhaseRot_ClearPreview." },
+  { "PhaseRot_ClearPreview", (void*)API_PhaseRot_ClearPreview, (void*)VA_PhaseRot_ClearPreview,
+    "bool\0MediaItem_Take*\0take\0End a PhaseRot_SetPreview audition on the take." },
+  { "PhaseRot_ClearAllPreviews", (void*)API_PhaseRot_ClearAllPreviews, (void*)VA_PhaseRot_ClearAllPreviews,
+    "void\0\0\0End all PhaseRot_SetPreview auditions in all open projects." },
   { "PhaseRot_Analyze", (void*)API_PhaseRot_Analyze, (void*)VA_PhaseRot_Analyze,
     "bool\0MediaItem_Take*\0take\0Analyse the take's ORIGINAL audio (ignoring any phase rotation already applied). The result is stored in the ExtState section 'phaserot', key 'analysis' (read it with GetExtState) as key=value pairs: chN_rx (RX-compatible suggested angle, L8 criterion), chN_peak (minimum sample peak angle), linked_rx, linked_peak, chN_before / chN_after_rx / chN_minpeak (linear peak levels), chN_pos_before, chN_neg_before, chN_pos_after, chN_neg_after, shapeN (360 comma-separated envelope values by phase degree)." },
+  { "PhaseRot_AnalyzeEx", (void*)API_PhaseRot_AnalyzeEx, (void*)VA_PhaseRot_AnalyzeEx,
+    "bool\0MediaItem_Take*,int,int,double,double\0take,ap_type,ap_stages,ap_freq,ap_q\0Like PhaseRot_Analyze, but the audio is first passed through the given allpass rotator (see PhaseRot_SetTake), so the suggested angles are those to apply after it." },
   { "PhaseRot_GetDebug", (void*)API_PhaseRot_GetDebug, (void*)VA_PhaseRot_GetDebug,
     "bool\0MediaItem_Take*\0take\0Debug: writes counters of the take's source wrapper to ExtState phaserot/debug." },
   { "PhaseRot_Refresh", (void*)API_PhaseRot_Refresh, (void*)VA_PhaseRot_Refresh,

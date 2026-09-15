@@ -16,6 +16,10 @@ desc:Phase Rotation (RX-style, Hilbert)
 // centres (one sub-block of look-ahead). On speech this matches the peak levels
 // of RX's adaptive mode (see tests/RX_REFERENCE.md).
 //
+// Optional "allpass rotator" (broadcast phase rotator, e.g. Orban's 4 x 200 Hz or the
+// old VoicePhaseRotator's 8 x second-order 200 Hz / Q 0.35) runs before the rotation;
+// the adaptive estimator sees its output.
+//
 // Part of "REAPER Phase Rotation": https://github.com/dennech/reaper-phase-rotation
 // The Lua script "Phase Rotation (RX-style).lua" drives this effect
 // (Suggest / Preview / Render). It can also be used stand-alone.
@@ -32,6 +36,10 @@ slider4:adaptive=0<0,1,1{Off,On}>Adaptive phase rotation
 slider5:adapt_smooth=0<0,2,1{Off,Light (median of 3),Strong (median of 5)}>Adaptive smoothing
 slider6:cur_l_deg=0<-180,180,0.01>-Current L rotation (read-only)
 slider7:cur_r_deg=0<-180,180,0.01>-Current R rotation (read-only)
+slider8:ap_type=0<0,2,1{Off,First-order sections,Second-order sections (Q)}>Allpass rotator
+slider9:ap_stages=4<1,16,1>Allpass stages
+slider10:ap_freq=200<20,2000,1>Allpass frequency (Hz)
+slider11:ap_q=0.35<0.1,10,0.01>Allpass Q (second-order only)
 
 in_pin:left input
 in_pin:right input
@@ -62,11 +70,47 @@ BINS_R = 262144 + 1280;   // NB values
 PREV   = 262144 + 2048;   // 4*SUB values: dry (re,im) and wet (re,im) of the previous block's last sub-block
 ESTL   = 262144 + 40000;  // estimate history L (degrees): [0..3] = previous block's sub-blocks, [4..7] = current block
 ESTR   = 262144 + 40016;
+APST   = 262144 + 40064;  // allpass state: 2 channels x 16 stages x 2 values (after ESTL/ESTR, clear of PREV)
 
 function bessel_i0(x) local(s, t, k, q) (
   q = x * x * 0.25; s = 1; t = 1; k = 1;
   loop(80, t *= q / (k * k); s += t; k += 1;);
   s;
+);
+
+// allpass rotator: identical sections, same designs as the extension / reference.py
+//   first-order:  c = (tan(pi f0/fs) - 1) / (tan(pi f0/fs) + 1)
+//   second-order: RBJ allpass, alpha = sin(w0) / (2Q)
+function ap_design() local(kk, w0_, alp, nrm) (
+  ap_type >= 1.5 ? (
+    w0_ = 2 * $pi * min(ap_freq, srate * 0.45) / srate;
+    alp = sin(w0_) / (2 * max(ap_q, 0.05));
+    nrm = 1 + alp;
+    apb0 = (1 - alp) / nrm; apb1 = -2 * cos(w0_) / nrm; apb2 = 1; apa1 = apb1; apa2 = apb0;
+  ) : (
+    kk = tan($pi * min(ap_freq, srate * 0.45) / srate);
+    apc = (kk - 1) / (kk + 1);
+  );
+  apn = ap_type >= 0.5 ? floor(ap_stages + 0.5) : 0;
+);
+// one sample through the cascade; base = state offset of the channel (0 or 32)
+function ap_run(x, base) local(i, y, s1, s2) (
+  i = 0;
+  loop(apn,
+    ap_type >= 1.5 ? (
+      s1 = APST[base + 2 * i]; s2 = APST[base + 2 * i + 1];
+      y = apb0 * x + s1;
+      APST[base + 2 * i] = apb1 * x - apa1 * y + s2;
+      APST[base + 2 * i + 1] = apb2 * x - apa2 * y;
+    ) : (
+      s1 = APST[base + 2 * i];
+      y = apc * x + s1;
+      APST[base + 2 * i] = x - apc * y;
+    );
+    x = y;
+    i += 1;
+  );
+  x;
 );
 
 function setup() local(k, w, i0b, i) (
@@ -94,6 +138,7 @@ function setup() local(k, w, i0b, i) (
   memset(OUTBUF, 0, 2 * HOP);
   memset(PREV, 0, 4 * SUB);
   memset(ESTL, 0, 16); memset(ESTR, 0, 16);
+  memset(APST, 0, 64);
   pos = 0;
 
   i = 0;
@@ -282,6 +327,7 @@ function process_block() local(k, n, j, xl, xr, hl, hr, cl, sl, cr, sr_, o, base
 
 // ---- top-level @init code (kept after the function definitions) ------------
 setup();
+ap_design();
 cur_l = angle_l * $pi / 180; cur_r = angle_r * $pi / 180;
 prev_l = angle_l; prev_r = angle_r;
 
@@ -290,8 +336,10 @@ link ? (
   angle_l != prev_l ? ( angle_r = angle_l; ) : ( angle_r != prev_r ? ( angle_l = angle_r; ) );
 );
 prev_l = angle_l; prev_r = angle_r;
+ap_design();
 
 @sample
+apn > 0 ? ( spl0 = ap_run(spl0, 0); spl1 = ap_run(spl1, 32); );
 INBUF[2 * (MFIR - 1 + pos)]     = spl0;
 INBUF[2 * (MFIR - 1 + pos) + 1] = spl1;
 spl0 = OUTBUF[2 * pos];
@@ -299,7 +347,7 @@ spl1 = OUTBUF[2 * pos + 1];
 pos += 1;
 pos >= HOP ? ( process_block(); pos = 0; );
 
-@gfx 360 90
+@gfx 400 100
 gfx_r = 0.16; gfx_g = 0.17; gfx_b = 0.19; gfx_a = 1;
 gfx_rect(0, 0, gfx_w, gfx_h);
 gfx_setfont(1, "Arial", 14);
@@ -312,5 +360,10 @@ adaptive ? (
   link ? gfx_printf("Fixed rotation  L %+.1f deg   R %+.1f deg  (linked)", angle_l, angle_r)
        : gfx_printf("Fixed rotation  L %+.1f deg   R %+.1f deg", angle_l, angle_r);
 );
-gfx_x = 10; gfx_y = 54; gfx_r = 0.55; gfx_g = 0.55; gfx_b = 0.55;
+gfx_x = 10; gfx_y = 54;
+apn > 0 ? (
+  ap_type >= 1.5 ? gfx_printf("Allpass rotator: %d x 2nd-order @ %.0f Hz, Q %.2f", apn, ap_freq, ap_q)
+                 : gfx_printf("Allpass rotator: %d x 1st-order @ %.0f Hz", apn, ap_freq);
+) : gfx_printf("Allpass rotator: off");
+gfx_x = 10; gfx_y = 74; gfx_r = 0.55; gfx_g = 0.55; gfx_b = 0.55;
 gfx_printf("Hilbert FIR %d taps, latency %d smp (%.0f ms), compensated", MFIR, pdc_delay, pdc_delay * 1000 / srate);

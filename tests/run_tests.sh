@@ -71,14 +71,25 @@ fi
 echo "---- verify:"; "$PY" "$REPO/tests/reference.py" verify "$SCRATCH/testsignals" "$PR_TEST_OUT"
 
 # ---- GUI smoke test (scripted actions through the real GUI script)
-export PHASE_ROTATION_TEST_LOG="$SCRATCH/gui.log" PHASE_ROTATION_TEST_ACTIONS="link_on,dump,suggest,dump,next,dump,angle=12.5,dump,link_off,angle=-20,dump,angle=0,dump,bypass,dump,bypass,adaptive,dump,adaptive,preview,preview,render,dump,remove,quit"
-rm -f "$PHASE_ROTATION_TEST_LOG"
+# Suggest must only stage the angle; Apply commits; the allpass preset must reach the audio (checked against numpy).
+export PHASE_ROTATION_TEST_LOG="$SCRATCH/gui.log"
+export PHASE_ROTATION_TEST_ACTIONS="instant_off,link_on,dump,suggest,dump,apply,dump,next,dump,angle=12.5,apply,dump,link_off,angle=-20,apply,dump,angle=0,apply,dump,bypass,dump,bypass,adaptive,apply,dump,adaptive,rotator=3,apply,dump,dumpaudio=$SCRATCH/out/gui_ap.f32,rotator=1,apply,preview,preview,render,dump,remove,dump,quit"
+rm -f "$PHASE_ROTATION_TEST_LOG" "$SCRATCH/out/gui_ap.f32"
 export PR_TEST_OUT="$SCRATCH/gui_smoke.log" PR_PROJ="$SCRATCH/proj/gui.rpp"
 run_reaper "$REPO/tests/gui_smoke.lua" "$SCRATCH/gui_smoke.log" "gui smoke end"
 echo "---- GUI smoke:"; cat "$SCRATCH/gui_smoke.log"; cat "$PHASE_ROTATION_TEST_LOG"
 if grep -q ERROR "$SCRATCH/gui_smoke.log" "$PHASE_ROTATION_TEST_LOG"; then echo "GUI SMOKE FAILED"; exit 1; fi
-# after Suggest the first item (asym_mono) must carry the RX-style angle (+77.6)
-if ! grep -q "res=77.625" "$PHASE_ROTATION_TEST_LOG"; then echo "GUI SMOKE FAILED: Suggest did not produce the expected angle"; exit 1; fi
+# Suggest stages the RX-style angle (+77.6) for asym_mono but does not touch the item
+if ! grep -q "staged=77.625/77.625 ap=RX-style applied=- " "$PHASE_ROTATION_TEST_LOG"; then echo "GUI SMOKE FAILED: Suggest must stage +77.6 without applying"; exit 1; fi
+# Apply commits it
+if ! grep -q "applied=L=77.6 R=77.6 RX-style" "$PHASE_ROTATION_TEST_LOG"; then echo "GUI SMOKE FAILED: Apply did not commit the suggested angle"; exit 1; fi
 # unlinked: L set to 0 after -20 must apply (0 is a valid angle), R keeps its own value
-if ! grep -q "L=0.0 R=12.5" "$PHASE_ROTATION_TEST_LOG"; then echo "GUI SMOKE FAILED: setting 0 degrees did not apply"; exit 1; fi
+if ! grep -q "applied=L=0.0 R=12.5 RX-style" "$PHASE_ROTATION_TEST_LOG"; then echo "GUI SMOKE FAILED: setting 0 degrees did not apply"; exit 1; fi
+# the Orban preset reaches the item
+if ! grep -q "applied=L=0.0 R=12.5 Orban 4" "$PHASE_ROTATION_TEST_LOG"; then echo "GUI SMOKE FAILED: allpass preset was not applied"; exit 1; fi
+# after Reset nothing is applied
+if ! tail -3 "$PHASE_ROTATION_TEST_LOG" | grep -q "applied=- "; then echo "GUI SMOKE FAILED: Reset left something applied"; exit 1; fi
+# the AUDIO of the item (read back through REAPER) equals allpass 4x200 + rotation (L 0, R 12.5) computed by numpy
+echo "---- audio check (GUI-applied item vs numpy reference):"
+"$PY" "$REPO/tests/reference.py" checkaudio "$SCRATCH/testsignals/asym_stereo.wav" "$SCRATCH/out/gui_ap.f32" 2 "1,4,200,0.35" "0,12.5" || { echo "GUI AUDIO CHECK FAILED"; exit 1; }
 echo "ALL TESTS PASSED"

@@ -147,6 +147,84 @@ def db(v):
     return 20 * math.log10(max(v, 1e-12))
 
 
+# ---------------------------------------------------------------- allpass rotator
+# Same designs as extension/src/phaserot.cpp (dsp::ap_design) and phase_rotation.jsfx (ap_design):
+#   type 1: first-order allpass, c = (tan(pi f0/fs) - 1) / (tan(pi f0/fs) + 1)
+#   type 2: RBJ second-order allpass at f0 with Q
+# Sections are identical and cascaded; the filter runs before the Hilbert rotation.
+
+def allpass_first(x, sr, f0, n):
+    from scipy import signal
+    k = math.tan(math.pi * min(f0, sr * 0.45) / sr)
+    c = (k - 1) / (k + 1)
+    y = np.asarray(x, dtype=np.float64)
+    for _ in range(n):
+        y = signal.lfilter([c, 1.0], [1.0, c], y)
+    return y
+
+
+def allpass_biquad(x, sr, f0, q, n):
+    from scipy import signal
+    w0 = 2 * math.pi * min(f0, sr * 0.45) / sr
+    alpha = math.sin(w0) / (2 * max(q, 0.05))
+    a0 = 1 + alpha
+    b0, b1 = (1 - alpha) / a0, -2 * math.cos(w0) / a0
+    y = np.asarray(x, dtype=np.float64)
+    for _ in range(n):
+        y = signal.lfilter([b0, b1, 1.0], [1.0, b1, b0], y)
+    return y
+
+
+def apply_ap(x, sr, ap):
+    """ap = (type, stages, freq, q); type 0 = off."""
+    t, n, f, q = int(ap[0]), int(ap[1]), float(ap[2]), float(ap[3])
+    if t == 0 or n <= 0:
+        return np.asarray(x, dtype=np.float64)
+    return allpass_first(x, sr, f, n) if t == 1 else allpass_biquad(x, sr, f, q, n)
+
+
+def parse_ap(text):
+    parts = [float(v) for v in str(text).split(",")]
+    while len(parts) < 4:
+        parts.append(0.0)
+    return tuple(parts[:4])
+
+
+def process_reference(x, sr, angle_deg, ap=(0, 0, 0, 0)):
+    """Full reference chain: allpass rotator, then broadband rotation by angle_deg.
+    REAPER keeps reading (silence) past the source end, so the IIR tail continues into the
+    Hilbert FIR's context: the allpass runs on a zero-padded input before the rotation."""
+    n = len(x)
+    pad = (fir_length(sr) - 1) // 2 + 8192
+    y = apply_ap(np.concatenate([np.asarray(x, dtype=np.float64), np.zeros(pad)]), sr, ap)
+    return rotate(y, hilbert_fir(y, sr), angle_deg)[:n]
+
+
+def checkaudio(wav, dump, nch, ap_text, angles_text, tol=1e-5):
+    """Compare a float32 dump of a REAPER take (interleaved nch) with the reference chain."""
+    sr, src = read_wav(wav)
+    out = np.fromfile(dump, dtype="<f4").astype(np.float64).reshape(-1, nch).T
+    ap = parse_ap(ap_text)
+    angles = [float(v) for v in str(angles_text).split(",")]
+    n = min(src.shape[1], out.shape[1])
+    fails = 0
+    for c in range(min(nch, src.shape[0])):
+        ref = process_reference(src[c], sr, angles[min(c, len(angles) - 1)], ap)
+        # the last FIR half-length sees zero padding differently in REAPER (source end) - ignore the tail
+        m = n - 16
+        err = np.abs(out[c][:m] - ref[:m]).max()
+        ok = err < tol
+        fails += 0 if ok else 1
+        print(("PASS " if ok else "FAIL ") + f"audio ch{c}: max|REAPER - reference| = {err:.2e} (angle {angles[min(c, len(angles)-1)]}, allpass {ap})")
+        # and it must differ from the ORIGINAL unless the chain is the identity
+        if ap[0] != 0 or angles[min(c, len(angles) - 1)] != 0:
+            d0 = np.abs(out[c][:m] - src[c][:m]).max()
+            ok2 = d0 > 1e-3
+            fails += 0 if ok2 else 1
+            print(("PASS " if ok2 else "FAIL ") + f"audio ch{c} differs from the original: max diff {d0:.3f}")
+    return fails
+
+
 # ---------------------------------------------------------------- test signals
 
 def voice_like(sr, dur, f0=118.0, seed=1, formants=((600, 0.06), (1150, 0.08), (2500, 0.1))):
@@ -376,17 +454,17 @@ def verify(outdir, logpath):
         check(f"render {fid} samplerate", sr_out == sr_in, f"{sr_out} vs {sr_in}")
         n = min(src.shape[1], out.shape[1])
         check(f"render {fid} length", out.shape[1] >= src.shape[1] - 2, f"out {out.shape[1]} src {src.shape[1]} (a render tail is fine, the item is trimmed)")
+        ap = parse_ap(results.get(fid + ".render_ap", "0,0,0,0"))
         for ci in range(src.shape[0]):
             x = src[ci]
-            hx = hilbert_fir(x, sr_in)
-            ref = rotate(x, hx, angles[min(ci, len(angles) - 1)])
+            ref = process_reference(x, sr_in, angles[min(ci, len(angles) - 1)], ap)
             oc = out[min(ci, out.shape[0] - 1)]
             # REAPER feeds a couple of samples past the source end into the FX, which
             # the non-causal Hilbert FIR spreads over the last few output samples.
             err = np.abs(oc[:n - 16] - ref[:n - 16]).max()
             err_tail = np.abs(oc[n - 16:n] - ref[n - 16:n]).max()
             check(f"render {fid} ch{ci} max error", err < 2e-4 and err_tail < 2e-2,
-                  f"max|err|={err:.2e} (last 16 samples {err_tail:.2e}) angle={angles[min(ci, len(angles)-1)]}")
+                  f"max|err|={err:.2e} (last 16 samples {err_tail:.2e}) angle={angles[min(ci, len(angles)-1)]} allpass={ap}")
         if fid == "click":
             oc = out[0]
             check("render click position (PDC)", int(np.argmax(np.abs(oc))) == e["click_index"], f"argmax {int(np.argmax(np.abs(oc)))} expected {e['click_index']}")
@@ -423,7 +501,9 @@ def verify(outdir, logpath):
     if "trackfx_enabled_after" in results:
         check("track FX re-enabled after render", results["trackfx_enabled_after"] == "true", results["trackfx_enabled_after"])
     # ---- reaper_phaserot extension (source wrapper) checks
-    if results.get("ext.api") == "true":
+    if results.get("ext.api") == "true" and "ext.clear.peak" not in results:
+        check("ext: extension test ran to completion", False, "ext_test.lua stopped early (ReaScript error? see the extension log)")
+    elif results.get("ext.api") == "true":
         def f32(path, nch=1):
             d = np.fromfile(path, dtype="<f4").astype(np.float64)
             return d.reshape(-1, nch).T
@@ -447,6 +527,28 @@ def verify(outdir, logpath):
         e0 = np.abs(o2[0][:xs.shape[1]] - rotate(xs[0], hilbert_fir(xs[0], sr_s), 30.0)).max()
         e1 = np.abs(o2[1][:xs.shape[1]] - rotate(xs[1], hilbert_fir(xs[1], sr_s), -45.0)).max()
         check("ext: stereo unlinked angles (+30 / -45)", e0 < 1e-6 and e1 < 1e-6, f"{e0:.2e} {e1:.2e}")
+        # allpass rotator through the source engine
+        if "ext.ap4.dump" in results:
+            ap4 = (1, 4, 200, 0.35); vpr = (2, 8, 200, 0.35)
+            o = f32(results["ext.ap4.dump"])[0][:len(xa)]
+            e = np.abs(o[:-16] - apply_ap(xa, sr_a, ap4)[:-16]).max()
+            check("ext: allpass 4 x 200 Hz = reference", e < 1e-6, f"max|err|={e:.2e}")
+            o = f32(results["ext.vpr.dump"])[0][:len(xa)]
+            e = np.abs(o[:-16] - apply_ap(xa, sr_a, vpr)[:-16]).max()
+            check("ext: VoicePhaseRotator 8 x (200 Hz, Q 0.35) = reference", e < 1e-6, f"max|err|={e:.2e}")
+            o = f32(results["ext.ap4rot.dump"])[0][:len(xa)]
+            e = np.abs(o[:-16] - process_reference(xa, sr_a, 30.0, ap4)[:-16]).max()
+            check("ext: allpass 4 x 200 Hz + 30 deg = reference (allpass first)", e < 1e-6, f"max|err|={e:.2e}")
+            xa4 = apply_ap(xa, sr_a, ap4)
+            ref_ang, _, _ = best_angle(xa4, hilbert_fir(xa4, sr_a))
+            check("ext: AnalyzeEx suggests the angle for the allpass output", abs(float(results["ext.analyze_ap_rx"]) - ref_ang) <= 0.35,
+                  f"got {results['ext.analyze_ap_rx']} ref {ref_ang:.3f} (plain {byid['asym_mono']['channels'][0]['best_angle']:.3f})")
+            pk_prev = float(results["ext.preview.peak"])
+            check("ext: preview plays the rotated audio while nothing is applied", results["ext.preview.params"] == "false" and abs(pk_prev - np.abs(ref78).max()) < 1e-3,
+                  f"peak {pk_prev:.4f} params={results['ext.preview.params']}")
+            check("ext: preview leaves the waveform peaks at the original", abs(float(results["ext.preview.peaks_max"]) - xa.max()) < 2e-3, results["ext.preview.peaks_max"])
+            check("ext: clearing the preview restores the original", abs(float(results["ext.preview_clear.peak"]) - np.abs(xa).max()) < 1e-3, results["ext.preview_clear.peak"])
+            check("ext: seek continuity (allpass state across consecutive reads)", float(results["ext.ap.seekdiff"]) < 1e-9, results["ext.ap.seekdiff"])
         adf = results["ext.adaptive.file"]
         sr_d, xd = read_wav(adf); xd = xd[0]; hd = hilbert_fir(xd, sr_d)
         oa = f32(results["ext.adaptive.dump"])[0]; n = min(len(oa), len(xd)); oa = oa[:n]
@@ -464,6 +566,12 @@ def verify(outdir, logpath):
             p1 = db(np.abs(oa[sr_d // 2:half - sr_d // 2]).max()); b1 = db(np.abs(xd[sr_d // 2:half - sr_d // 2]).max())
             p2 = db(np.abs(oa[half + sr_d // 2:-sr_d // 2]).max()); b2 = db(np.abs(xd[half + sr_d // 2:-sr_d // 2]).max())
             check("ext: adaptive improves both halves of adaptive_switch", p1 <= b1 - 0.5 and p2 <= b2 - 0.5, f"{b1:.2f}->{p1:.2f}, {b2:.2f}->{p2:.2f}")
+    if "asym_mono.ap4_angle0" in results:
+        sr_a, xa = read_wav(byid["asym_mono"]["file"]); xa = xa[0]
+        xa4 = apply_ap(xa, sr_a, (1, 4, 200, 0.35))
+        ref_ang, _, _ = best_angle(xa4, hilbert_fir(xa4, sr_a))
+        check("lua analysis through the allpass 4 x 200 Hz", abs(float(results["asym_mono.ap4_angle0"]) - ref_ang) <= 0.35,
+              f"got {results['asym_mono.ap4_angle0']} ref {ref_ang:.3f}")
     if "long_stereo.analyze_seconds" in results:
         print("timing: long_stereo (90 s stereo) analyzed in", results["long_stereo.analyze_seconds"], "s")
     print("\n%d failure(s)" % fails)
@@ -476,5 +584,8 @@ if __name__ == "__main__":
         gen(sys.argv[2])
     elif cmd == "verify":
         sys.exit(1 if verify(sys.argv[2], sys.argv[3]) else 0)
+    elif cmd == "checkaudio":
+        # checkaudio <src.wav> <dump.f32> <nch> <ap "type,stages,freq,q"> <angles "L[,R]">
+        sys.exit(1 if checkaudio(sys.argv[2], sys.argv[3], int(sys.argv[4]), sys.argv[5], sys.argv[6]) else 0)
     else:
         fir_report()
