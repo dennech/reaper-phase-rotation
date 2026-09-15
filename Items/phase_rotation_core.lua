@@ -828,8 +828,8 @@ function core.clear_take(take)
 end
 
 function core.analyze_any(take, opts, progress)
-  if core.mode() == "source" then return core.analyze_ext(take, opts) end
-  return core.analyze(take, opts, progress)
+  if core.mode() == "source" and (not core.ap_on(opts and opts.ap) or core.has_preview_api()) then return core.analyze_ext(take, opts) end
+  return core.analyze(take, opts, progress)   -- take-FX engine, or an older extension without PhaseRot_AnalyzeEx
 end
 
 return core

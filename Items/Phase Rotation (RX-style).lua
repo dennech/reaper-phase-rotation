@@ -88,6 +88,8 @@ local function take_state(e)
   return e.st
 end
 
+local stop_preview   -- forward (a running audition ends when the selection changes)
+
 -- staged angles start from the applied state (or 0)
 local function init_staged(e)
   local key = e.guid .. tostring(e.take)
@@ -113,18 +115,23 @@ local function refresh_items(force)
   end
   sig = table.concat(sig, "|")
   if not force and sig == sel_sig then return end
+  local changed = sig ~= sel_sig
   sel_sig = sig
+  if changed and preview.on then stop_preview() end
   items = list
   for _, e in ipairs(items) do
     e.info = core.take_info(e.take)
     local c = cache[e.guid .. tostring(e.take)]
     e.res = c and c.res
     init_staged(e)
-    -- pick up the applied rotator type / adaptive flag of the selection
-    local st = take_state(e)
-    if st and not S.applied_seen then S.adaptive = st.adaptive; S.ap = core.ap_copy(st.ap); S.applied_seen = true end
   end
   if cur > #items then cur = max(1, #items) end
+  -- the rotator type / adaptive flag shown in the window follow the selection: an applied state wins,
+  -- otherwise the user's own (unapplied) choice stays, otherwise the defaults
+  local e0 = items[cur]
+  local st0 = e0 and take_state(e0)
+  if st0 then S.adaptive = st0.adaptive; S.ap = core.ap_copy(st0.ap)
+  elseif changed and not S.user_touched then S.adaptive = false; S.ap = core.ap_copy(core.AP_OFF) end
 end
 
 local function staged_state(e)
@@ -180,7 +187,7 @@ local function apply_all(undo_name)
   for _, e in ipairs(items) do if set_state(e, staged_state(e)) then n = n + 1 end end
   r.Undo_EndBlock(undo_name or "Phase Rotation: apply", -1)
   r.UpdateArrange()
-  if preview.on and MODE == "fx" then preview.restore = {} end   -- the FX now holds the applied state: nothing to undo on stop
+  if preview.on and not HAS_PREVIEW then preview.takes = {} end   -- the items now hold the applied state: nothing to restore on stop
   return n
 end
 
@@ -246,7 +253,7 @@ local function do_revert()
   set_status("Reverted to the applied settings")
 end
 
-local function stop_preview()
+stop_preview = function()
   if not preview.on then return end
   if r.GetPlayState() & 1 == 1 then r.OnStopButton() end
   if preview.cursor then r.SetEditCurPos(preview.cursor, false, false) end
@@ -255,14 +262,12 @@ local function stop_preview()
       if r.ValidatePtr2(0, tr, "MediaTrack*") then r.SetMediaTrackInfo_Value(tr, "I_SOLO", v) end
     end
   end
-  for _, e in ipairs(items) do
-    if r.ValidatePtr2(0, e.take, "MediaItem_Take*") then
-      if HAS_PREVIEW then core.ext_clear_preview(e.take)
-      elseif MODE == "fx" and preview.restore then
-        local rs = preview.restore[tostring(e.take)]
-        if rs == false then core.remove_fx(e.take)
-        elseif rs then local fx = core.find_fx(e.take) if fx >= 0 then core.set_state(e.take, fx, rs) end end
-      end
+  -- every take that received preview settings (also ones no longer selected) is put back
+  for key, pv in pairs(preview.takes or {}) do
+    if r.ValidatePtr2(0, pv.take, "MediaItem_Take*") then
+      if HAS_PREVIEW then core.ext_clear_preview(pv.take)
+      elseif pv.restore == false then core.clear_take(pv.take)
+      elseif pv.restore then core.set_take_state(pv.take, pv.restore) end
     end
   end
   preview = { on = false }
@@ -301,18 +306,18 @@ end
 
 -- send the staged settings to the audition path (source engine: playback-only override;
 -- take-FX engine: the FX parameters themselves, restored when the preview stops)
+-- source engine with the preview API: playback-only override. Take-FX engine (and an older
+-- extension without the preview API): the staged state is written temporarily and restored on stop.
 push_preview = function()
   if not preview.on then return end
+  preview.takes = preview.takes or {}
   for _, e in ipairs(items) do
+    local key = tostring(e.take)
     if HAS_PREVIEW then
       core.ext_preview(e.take, staged_state(e))
-    elseif MODE == "fx" then
-      preview.restore = preview.restore or {}
-      local key = tostring(e.take)
-      if preview.restore[key] == nil then
-        local fx = core.find_fx(e.take)
-        preview.restore[key] = fx >= 0 and core.get_state(e.take, fx) or false
-      end
+      preview.takes[key] = preview.takes[key] or { take = e.take }
+    else
+      if not preview.takes[key] then preview.takes[key] = { take = e.take, restore = core.get_take_state(e.take) or false } end
       core.set_take_state(e.take, staged_state(e))
     end
   end
@@ -378,7 +383,7 @@ end
 local function toggle_link() set_link(not S.link) end
 
 local function set_adaptive(v)
-  S.adaptive = v
+  S.adaptive = v; S.user_touched = true
   staged_changed("Phase Rotation: adaptive", true)
 end
 
@@ -397,9 +402,14 @@ local function set_angle(e, which, v, final)
 end
 
 local function set_rotator(ap)
-  S.ap = core.ap_copy(ap)
+  S.ap = core.ap_copy(ap); S.user_touched = true
   invalidate_analyses()
   staged_changed("Phase Rotation: rotator type", true)
+end
+
+local function set_instant(v)
+  S.instant = v
+  if v and any_dirty() then apply_all("Phase Rotation: apply") end
 end
 
 -- --------------------------------------------------------------------- gfx
@@ -644,9 +654,7 @@ local function open_settings_menu()
   if sel == 1 or sel == 2 then S.criterion = sel == 1 and "rx" or "peak"
   elseif sel >= 3 and sel <= 5 then S.smooth = sel - 3; staged_changed("Phase Rotation: adaptive smoothing", true)
   elseif sel == 6 then S.solo_preview = not S.solo_preview
-  elseif sel == 7 then
-    S.instant = not S.instant
-    if S.instant and any_dirty() then apply_all("Phase Rotation: apply") end
+  elseif sel == 7 then set_instant(not S.instant)
   elseif sel == 8 then S.show_plot = not S.show_plot; resize_window()
   elseif MODE == "fx" and sel == nfixed + 1 then S.keep_original = not S.keep_original
   elseif MODE == "fx" and sel == nfixed + 2 then
@@ -871,8 +879,8 @@ local function run_test_action(a)
   elseif a == "link" then toggle_link()
   elseif a == "link_on" then set_link(true)
   elseif a == "link_off" then set_link(false)
-  elseif a == "instant_on" then S.instant = true
-  elseif a == "instant_off" then S.instant = false
+  elseif a == "instant_on" then set_instant(true)
+  elseif a == "instant_off" then set_instant(false)
   elseif a == "adaptive" then set_adaptive(not S.adaptive)
   elseif a == "next" then cur = cur < #items and cur + 1 or 1
   elseif a == "preview" then if preview.on then stop_preview() else start_preview() end
