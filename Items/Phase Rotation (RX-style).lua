@@ -1,6 +1,6 @@
 -- @description Phase Rotation (RX-style): suggest, audition and apply broadband phase rotation to selected items
 -- @author dennech
--- @version 1.1.1
+-- @version 1.1.2
 -- @provides
 --   [nomain] phase_rotation_core.lua
 --   [effect] phase_rotation.jsfx
@@ -152,7 +152,7 @@ local function do_suggest()
   r.UpdateArrange()
   if errs == 0 then
     set_status(string.format("Suggested rotation for %d item(s) in %.2f s%s", #items, r.time_precise() - t0,
-      MODE == "source" and " · applied to the source, waveform updated" or " · applied as take FX"))
+      MODE == "source" and " · applied to the source" or " · applied as take FX"))
   end
 end
 
@@ -283,6 +283,20 @@ local function line(x1, y1, x2, y2) gfx.line(x1 * sc, y1 * sc, x2 * sc, y2 * sc,
 local function text(x, y, s, w, h, flags)
   gfx.x, gfx.y = x * sc, y * sc
   if w then gfx.drawstr(s, flags or 0, (x + w) * sc, (y + (h or 20)) * sc) else gfx.drawstr(s) end
+end
+-- Truncates s with an ellipsis so it fits into wmax (logical pixels); uses the current font.
+local function fit_text(s, wmax)
+  if gfx.measurestr(s) / sc <= wmax then return s end
+  local n = #s
+  while n > 1 do
+    n = n - 1
+    local nb = s:byte(n + 1)
+    if nb < 0x80 or nb >= 0xC0 then -- do not cut inside a UTF-8 sequence
+      local t = s:sub(1, n):gsub("%s+$", "") .. "…"
+      if gfx.measurestr(t) / sc <= wmax then return t end
+    end
+  end
+  return s
 end
 local function inside(x, y, w, h) return mouse.x >= x and mouse.x < x + w and mouse.y >= y and mouse.y < y + h end
 
@@ -598,7 +612,7 @@ draw = function()
   text(W - 250, H - 16, MODE == "source" and "engine: source (reaper_phaserot)" or "engine: take FX · install reaper_phaserot for waveform display", 236, 14, 2)
   if status ~= "" then
     col(C.dim); font(13)
-    text(324, H - 44, status, W - 324 - 20, 20, 4)
+    text(324, H - 44, fit_text(status, W - 324 - 20), W - 324 - 20, 20, 4)
   end
   draw_progress()
 end

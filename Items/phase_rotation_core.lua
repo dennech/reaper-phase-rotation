@@ -13,7 +13,7 @@
 local r = reaper
 local core = {}
 
-core.VERSION = "1.1.1"
+core.VERSION = "1.1.2"
 core.SECTION = "dennech_PhaseRotation"           -- ExtState section
 core.JSFX_FILE = "phase_rotation.jsfx"
 core.FX_DESC = "Phase Rotation (RX-style, Hilbert)"

@@ -11,8 +11,9 @@
 ]]></description>
         <link rel="website">https://github.com/dennech/reaper-phase-rotation</link>
       </metadata>
-      <version name="1.1.1" author="dennech" time="2026-09-14T20:30:00Z">
-        <changelog><![CDATA[1.1.1: analysis in source mode uses the item's window, play rate and channel mode; Link honoured by the extension's adaptive mode; JSFX adaptive interpolation matches the extension; legacy take FX removed when the source engine takes over; fixes from an independent code review.
+      <version name="1.1.2" author="dennech" time="2026-09-15T09:00:00Z">
+        <changelog><![CDATA[1.1.2: status line no longer overflows the window (ellipsis); README screenshot.
+1.1.1: analysis in source mode uses the item's window, play rate and channel mode; Link honoured by the extension's adaptive mode; JSFX adaptive interpolation matches the extension; legacy take FX removed when the source engine takes over; fixes from an independent code review.
 1.1.0: Suggest reproduces iZotope RX 10's values (L8 criterion, RX sign convention). New engine: with the reaper_phaserot extension the rotation is applied to the item's source (no files, no take FX, waveform updates immediately, plain project file). Adaptive mode with look-ahead interpolation matches RX's adaptive peaks. Take-FX engine kept as fallback.]]></changelog>
         <source main="main">https://github.com/dennech/reaper-phase-rotation/raw/main/Items/Phase%20Rotation%20(RX-style).lua</source>
         <source file="phase_rotation_core.lua">https://github.com/dennech/reaper-phase-rotation/raw/main/Items/phase_rotation_core.lua</source>

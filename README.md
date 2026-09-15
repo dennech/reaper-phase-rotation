@@ -13,8 +13,8 @@ phase rotation** mode. This project does the same inside REAPER:
 |----------------------------|-----------------------------------------------------------------------------|
 | Suggest                    | Analyses each selected item and sets the channel-linked fixed rotation. Reproduces RX 10's own Suggest values (verified against RX renders, see `tests/RX_REFERENCE.md`); a "minimum sample peak" criterion is available too |
 | Left / Right rotation [°]  | Sliders -180..+180 with a value box (click to type), Link button            |
-| Adaptive phase rotation    | The JSFX re-estimates the best angle every ~43 ms and glides between values |
-| Preview / Bypass           | Plays the item from its start; Bypass toggles the take FX                  |
+| Adaptive phase rotation    | Re-estimates the best angle every ~43 ms and glides between values (both engines) |
+| Preview / Bypass           | Plays the item from its start; Bypass switches the rotation off and on without losing the angles |
 | Render                     | Not needed. With the extension the rotation is applied to the item's source: the waveform display updates immediately, nothing is written, nothing is added to the item |
 | Compare                    | Not implemented - use Bypass and REAPER's undo instead                      |
 
@@ -37,7 +37,7 @@ a *Render* button (new take) is offered in this mode for that purpose.
 
 Angles use the same sign convention as RX; results match RX's Suggest (see below).
 
-*(Screenshot of the UI: see the [GitHub page](https://github.com/dennech/reaper-phase-rotation).)*
+![Phase Rotation (RX-style) window: Suggest, Left/Right rotation, Adaptive, Preview / Bypass / Reset](docs/screenshot.png)
 
 ## Installation
 
